@@ -477,7 +477,8 @@ private:
     // text via commit there; immodule frontends keep the key forward so
     // the spacebar semantics (page scrolling, button activation) survive.
     bool frontendNeedsCommit(const char *fe) {
-        return fe && (strcmp(fe, "xim") == 0 || strcmp(fe, "waylandim") == 0);
+        return fe && (strcmp(fe, "xim") == 0 || strcmp(fe, "waylandim") == 0 ||
+                      strcmp(fe, "ibus") == 0);
     }
 
     void holdEmitSpace() {
