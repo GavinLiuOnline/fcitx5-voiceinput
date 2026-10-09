@@ -25,6 +25,9 @@ jobs:
                 -DCMAKE_INSTALL_PREFIX=/usr
           cmake --build build -j"$(nproc)"
           cpack --config build/CPackConfig.cmake -G DEB
+          # Stage the deb outside build/: the snap build must not see a
+          # stale build/CMakeCache.txt (source: . copies the whole tree).
+          mkdir -p dist && cp build/dist/*.deb dist/
 
       - name: Build snap
         id: snapcraft
@@ -34,6 +37,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            build/dist/*.deb
+            dist/*.deb
             ${{ steps.snapcraft.outputs.snap }}
           generate_release_notes: true

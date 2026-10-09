@@ -26,6 +26,12 @@ parts:
     # Without an explicit source, the nil plugin copies nothing into the
     # part's src dir and the build scriptlet finds no CMakeLists.txt.
     source: .
+    # The workspace may carry a build/ dir from a prior deb build; its
+    # CMakeCache.txt records paths that do not exist inside the snapcraft
+    # instance and poisons the configure step. Purge it before building.
+    override-pull: |
+      craftctl default
+      rm -rf "${CRAFT_PART_SRC}/build" "${CRAFT_PART_SRC}"/build-*/
     build-packages:
       - cmake
       - g++
