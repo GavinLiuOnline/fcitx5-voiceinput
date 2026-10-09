@@ -106,16 +106,19 @@ fcitx5 -r                        # restart fcitx5
 2. Speak continuously — a live draft appears at the cursor (preedit) while
    you talk; every time you pause briefly, the phrase is finalized and
    committed, then recording continues.
-3. Press the hotkey again to stop; the trailing words are flushed first.
+3. Press the hotkey again (or release Space in hold-space mode) to stop; the
+   trailing words are flushed first. There is no recording time limit — the
+   session lasts exactly as long as you keep it open.
 
 Options are under **fcitx5-configtool → Addons → Voice Input**:
 
 | Option | Default | Description |
 | --- | --- | --- |
-| Trigger Key | `Ctrl+Alt+V` | Hotkey to start/stop a session |
+| Trigger Mode | Hold space | `Hotkey toggle`: press the hotkey to start/stop. `Hold space`: hold **Space** for the configured duration to start, release to stop |
+| Trigger Key | `Ctrl+Alt+V` | Hotkey to start/stop a session (hotkey mode; also works as a fallback in hold-space mode) |
+| Hold Space Milliseconds to Start | 2500 | Hold-space mode: milliseconds to hold Space before recording starts (500-10000); a shorter press types a normal space |
 | Recognition Language | Auto | auto / zh / en / ja / ko / yue |
 | Recognition Model | SenseVoice Small | See "Recognition models" below |
-| Auto-stop Idle Seconds (no new text) | 6 | Stops after this many seconds without new recognized text; each new draft or commit restarts the countdown |
 | Keys while recording | — | `Esc` finish; `Enter` insert a newline; `BackSpace` delete the last committed character; letters/digits/punctuation are typed straight into the text field |
 | Sentence Pause (ms; draft commits on pause) | 800 | Pause length that turns the live draft into committed text |
 | Inverse Text Normalization | On | Convert spoken numbers to digits |

@@ -14,7 +14,7 @@ Session protocol (stdout):
   PARTIAL\\n<draft text>\\n     live draft of the current phrase (preedit)
   COMMIT\\n<final text>\\n     final text of one VAD segment (committed)
   NEWLINE\\n                    line break requested via Enter (no payload)
-  TICK\\n<seconds>\\n           seconds left before the idle auto-stop
+  STATUS\\n<message>\\n        panel note (model download/loading)
   ERROR\\n<message>\\n          on failure
   DONE\\n                       session finished
 Diagnostics go to stderr.
@@ -765,33 +765,15 @@ def cmd_session(args) -> int:
         if not flush_vad():
             return 1
     else:
-        # Auto-stop after max_ms of idleness. The countdown restarts ONLY
-        # when genuinely new text appears: a segment with actual content,
-        # or a draft that grew longer. Noise-only VAD segments (empty
-        # recognition) and draft flicker on trailing silence must not keep
-        # the session alive forever.
-        idle_limit = args.max_ms / 1000.0
-        last_output_at = time.monotonic()
         last_partial_at = 0.0
         last_draft = ""
-        last_tick = -1
 
         try:
             # Continuous dictation: buffered audio feeds the VAD (whole
             # phrases -> COMMIT) and the streaming model (draft -> PARTIAL)
-            # until the idle timeout or SIGINT.
+            # until SIGINT (space released / hotkey pressed again). There is
+            # no idle timeout: session length is fully user-controlled.
             while True:
-                now_t = time.monotonic()
-                idle_for = now_t - last_output_at
-                if idle_for >= idle_limit:
-                    break
-                # Report remaining idle seconds (once per second) so the
-                # addon panel can show a live countdown.
-                remain = int(idle_limit - idle_for + 0.999999)
-                if remain != last_tick:
-                    last_tick = remain
-                    print("TICK", flush=True)
-                    print(remain, flush=True)
                 if flush_mode:
                     # Enter pressed: commit the pending segment now and
                     # keep listening; mode 2 also inserts a line break
@@ -803,7 +785,6 @@ def cmd_session(args) -> int:
                     if enter_newline:
                         print("NEWLINE", flush=True)
                     last_draft = ""
-                    last_output_at = time.monotonic()
                     if ostream is not None:
                         ostream = online.create_stream()
                     continue
@@ -825,12 +806,8 @@ def cmd_session(args) -> int:
                     text = emit_segment(seg)
                     if text is None:
                         return 1
-                    if text:
-                        last_output_at = time.monotonic()
-                        print(f"[voice] idle reset by commit: {text[:24]}",
-                              file=sys.stderr, flush=True)
-                    else:
-                        print("[voice] 忽略空识别段（噪声），不重置空闲计时",
+                    if not text:
+                        print("[voice] 忽略空识别段（噪声）",
                               file=sys.stderr, flush=True)
                     last_draft = ""
                     if ostream is not None:
@@ -846,13 +823,6 @@ def cmd_session(args) -> int:
                             if (draft and draft != last_draft
                                     and time.monotonic() - last_partial_at >= 0.3):
                                 last_partial_at = time.monotonic()
-                                if len(draft) > len(last_draft):
-                                    # A longer draft means genuinely new
-                                    # content; restart the idle countdown.
-                                    last_output_at = last_partial_at
-                                    print(f"[voice] idle reset by draft: "
-                                          f"{draft[:24]}",
-                                          file=sys.stderr, flush=True)
                                 last_draft = draft
                                 print("PARTIAL", flush=True)
                                 print(draft, flush=True)
@@ -860,8 +830,6 @@ def cmd_session(args) -> int:
                         print(f"[voice] 流式解码失败: {e}",
                               file=sys.stderr, flush=True)
                         ostream = None
-            if not flush_vad():
-                return 1
         except KeyboardInterrupt:
             # Trigger key pressed again: flush trailing audio and finish.
             try:
@@ -1053,7 +1021,6 @@ def main() -> int:
     p_sess.add_argument("--model", default=DEFAULT_MODEL_ID,
                         choices=MODEL_CHOICES)
     p_sess.add_argument("--lang", default="auto", choices=LANG_CHOICES)
-    p_sess.add_argument("--max-ms", type=int, default=6000)
     p_sess.add_argument("--silence-ms", type=int, default=800)
     p_sess.add_argument("--itn", action="store_true")
     p_sess.add_argument("--preedit", action="store_true",

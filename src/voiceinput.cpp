@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -154,20 +155,30 @@ struct VoiceModelStatusAnnotation {
     }
 };
 
+enum class TriggerMode {
+    HotkeyToggle,
+    HoldSpace,
+};
+FCITX_CONFIG_ENUM_NAME_WITH_I18N(TriggerMode, "HotkeyToggle", "HoldSpace");
+
 FCITX_CONFIGURATION(
     VoiceInputConfig,
     KeyListOption triggerKey{
         this, "TriggerKey", _("Trigger Key"), {Key("Control+Alt+V")},
         KeyListConstrain({KeyConstrainFlag::AllowModifierOnly})};
+    OptionWithAnnotation<TriggerMode, TriggerModeI18NAnnotation> triggerMode{
+        this, "TriggerMode", _("Trigger Mode"), TriggerMode::HoldSpace};
+    // fcitx-config has no double marshalling, so the hold duration is an
+    // int in milliseconds.
+    Option<int, IntConstrain> holdMs{
+        this, "HoldMs", _("Hold Space Milliseconds to Start"), 2500,
+        IntConstrain(500, 10000)};
     Option<VoiceLanguage> language{this, "Language", _("Recognition Language"),
                                    VoiceLanguage::Auto};
     OptionWithAnnotation<VoiceModel, VoiceModelStatusAnnotation> model{
         this, "Model", _("Recognition Model"), VoiceModel::SenseVoiceSmall,
         NoConstrain<VoiceModel>(), DefaultMarshaller<VoiceModel>(),
         VoiceModelStatusAnnotation{&modelDir}};
-    Option<int, IntConstrain> maxSeconds{
-        this, "MaxSeconds", _("Auto-stop Idle Seconds (no new text)"), 6,
-        IntConstrain(3, 120)};
     Option<int, IntConstrain> silenceMs{this, "SilenceMs",
                                         _("Sentence Pause (ms; draft commits on pause)"),
                                         800, IntConstrain(200, 5000)};
@@ -191,48 +202,16 @@ public:
             EventType::InputContextKeyEvent, EventWatcherPhase::PreInputMethod,
             [this](Event &event) {
                 auto &keyEvent = static_cast<KeyEvent &>(event);
+                if (config_.triggerMode.value() == TriggerMode::HoldSpace) {
+                    handleHoldSpace(keyEvent);
+                    return;
+                }
                 if (keyEvent.isRelease()) {
                     return;
                 }
                 if (!keyEvent.key().checkKeyList(config_.triggerKey.value())) {
                     if (recording_ && !interrupted_) {
-                        const auto &key = keyEvent.key();
-                        // Editing keys while dictating:
-                        //   Escape    end the session (same as trigger key)
-                        //   Return    insert a newline (after flushing the
-                        //             pending phrase)
-                        //   BackSpace delete the last committed character
-                        if (key.check(Key("Escape"))) {
-                            finalizeRecording();
-                            keyEvent.filterAndAccept();
-                            return;
-                        }
-                        if (key.check(Key("Return"))) {
-                            ::kill(child_, SIGUSR2);
-                            keyEvent.filterAndAccept();
-                            return;
-                        }
-                        if (key.check(Key("BackSpace"))) {
-                            if (auto *ic = keyEvent.inputContext()) {
-                                ic->forwardKey(Key("BackSpace"));
-                            }
-                            keyEvent.filterAndAccept();
-                            return;
-                        }
-                        // Any other simple printable key is typed straight
-                        // into the text field, so English letters, digits
-                        // and punctuation can be mixed into dictation.
-                        if (key.isSimple()) {
-                            const auto ch = Key::keySymToUnicode(key.sym());
-                            if (ch >= 0x20 && ch != 0x7f) {
-                                if (auto *ic = keyEvent.inputContext()) {
-                                    ic->commitString(
-                                        Key::keySymToUTF8(key.sym()));
-                                }
-                                keyEvent.filterAndAccept();
-                                return;
-                            }
-                        }
+                        editWhileRecording(keyEvent);
                     }
                     return;
                 }
@@ -346,20 +325,20 @@ private:
 
     void scheduleTick() {
         tickTimer_ = instance_->eventLoop().addTimeEvent(
-            CLOCK_MONOTONIC, 1000000, 100000,
+            CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + 1000000, 100000,
             [this](EventSourceTime *, uint64_t) {
                 if (!recording_) {
                     return false;
                 }
                 const auto elapsed =
                     (now(CLOCK_MONOTONIC) - startTime_) / 1000000;
-                if (interrupted_ &&
-                    elapsed > static_cast<uint64_t>(config_.maxSeconds.value() + 5)) {
+                // The session has no time limit - it ends when the user
+                // releases space / presses the hotkey again. The only
+                // watchdog is for a backend that ignores SIGINT while
+                // finalizing (model hang): never lock the panel forever.
+                if (interrupted_ && elapsed > 120) {
                     showStatus(_("Voice backend timeout"));
                     cancelSession();
-                    return false;
-                }
-                if (interrupted_) {
                     return false;
                 }
                 showStatus(recordingStatus());
@@ -369,7 +348,7 @@ private:
     }
 
     // Panel status line: a backend note (model download/loading) takes
-    // precedence; otherwise show elapsed time + idle auto-stop countdown.
+    // precedence; otherwise show elapsed recording time.
     std::string recordingStatus() const {
         if (!statusNote_.empty()) {
             return std::string("🎤 ") + statusNote_;
@@ -377,8 +356,7 @@ private:
         const auto elapsed =
             (now(CLOCK_MONOTONIC) - startTime_) / 1000000;
         return std::string("🎤 ") + _("Recording") + " " +
-               std::to_string(elapsed) + "s (" +
-               std::to_string(idleRemain_) + "s " + _("idle auto stop") + ")";
+               std::to_string(elapsed) + "s";
     }
 
     void trigger(InputContext *ic) {
@@ -399,8 +377,339 @@ private:
     // the remaining audio.
     void finalizeRecording() {
         interrupted_ = true;
-        showStatus(_("Recognizing..."));
+        // The tick keeps running until the backend exits; without this it
+        // would overwrite the panel with a still-counting "Recording Ns",
+        // which looks exactly like "released but still recording".
+        statusNote_ = _("Recognizing...");
+        showStatus(recordingStatus());
         ::kill(child_, SIGINT);
+    }
+
+    // Editing keys while dictating:
+    //   Escape    end the session (same as trigger key)
+    //   Return    insert a newline (after flushing the pending phrase)
+    //   BackSpace delete the last committed character
+    // Any other simple printable key is typed straight into the text field,
+    // so English letters, digits and punctuation can be mixed in.
+    void editWhileRecording(KeyEvent &keyEvent) {
+        const auto &key = keyEvent.key();
+        if (key.check(Key("Escape"))) {
+            finalizeRecording();
+            keyEvent.filterAndAccept();
+            return;
+        }
+        if (key.check(Key("Return"))) {
+            ::kill(child_, SIGUSR2);
+            keyEvent.filterAndAccept();
+            return;
+        }
+        if (key.check(Key("BackSpace"))) {
+            if (auto *ic = keyEvent.inputContext()) {
+                ic->forwardKey(Key("BackSpace"));
+            }
+            keyEvent.filterAndAccept();
+            return;
+        }
+        if (key.isSimple()) {
+            const auto ch = Key::keySymToUnicode(key.sym());
+            if (ch >= 0x20 && ch != 0x7f) {
+                if (auto *ic = keyEvent.inputContext()) {
+                    ic->commitString(Key::keySymToUTF8(key.sym()));
+                }
+                keyEvent.filterAndAccept();
+                return;
+            }
+        }
+    }
+
+    // Hold-space trigger. A usable KeyRelease cannot be relied on (some
+    // frontends swallow it entirely), so the key state is tracked through
+    // the event stream:
+    //   - auto-repeat presses carry KeyState::Repeat when the client
+    //     advertises ReportKeyRepeat and mean the key is still held;
+    //   - a flag-less press within 70ms of the previous one is still the
+    //     same hold (humans cannot type that fast);
+    //   - any other non-repeat press means the previous press already
+    //     ended, so its pending space is emitted immediately - typing
+    //     never waits for the hold threshold;
+    //   - without the repeat flag at all, activity fallback applies:
+    //     0.9s without any space event counts as released;
+    //   - while recording, only key activity refreshes a watchdog; 0.7s
+    //     of silence (or a real release event) stops the session;
+    //   - only a bare space is intercepted: Ctrl+Space etc. pass through;
+    //   - a preedit / candidate panel (pinyin) passes the space through so
+    //     the input method keeps its "space selects candidate" behavior;
+    //   - the deferred start aborts when the key already went up, so a
+    //     release racing the threshold cannot spawn a ghost session;
+    //   - during a finalizing session every space is swallowed - a hold
+    //     armed then would fire a stray recording after the session ends.
+    static constexpr uint64_t kProbeUs = 500000;      // activity check period
+    static constexpr uint64_t kSilenceUs = 900000;    // "released" threshold
+    static constexpr uint64_t kWatchdogUs = 700000;   // release-lost window
+    static constexpr uint64_t kFlaglessRepeatUs = 70000;
+
+    // A SIGBUS was observed when startSession() ran directly inside an
+    // sd-event time callback, so IC-touching work is deferred to the next
+    // loop iteration via a zero-delay time event. The event source is owned
+    // by the unique_ptr returned from addTimeEvent(): destroying it
+    // disables the source so the callback never runs (verified at runtime
+    // against the installed libFcitx5Utils). holdDefer_ must therefore keep
+    // it alive until it fired; replacing a previous, already-fired one-shot
+    // is harmless.
+    // IMPORTANT: addTimeEvent's usec is an ABSOLUTE moment on the given
+    // clock (sd-event semantics), NOT a delay from now - verified at
+    // runtime with /tmp/fcitx_timeprobe.cpp (a past moment like 1e6 us
+    // fires immediately). Every relative delay must be expressed as
+    // now() + delay. deferHold exploits this: 0 lies in the past, so the
+    // callback runs on the next dispatch - a proper "defer" semantic.
+    void deferHold(std::function<void()> action) {
+        holdDefer_ = instance_->eventLoop().addTimeEvent(
+            CLOCK_MONOTONIC, 0, 0,
+            [this, action = std::move(action)](EventSourceTime *, uint64_t) {
+                action();
+                return false;
+            });
+    }
+
+    void holdEmitSpace() {
+        auto *ic = instance_->inputContextManager().findByUUID(holdIcUuid_);
+        fprintf(stderr, "[voiceinput] hold: emitting space (ic=%p)\n",
+                static_cast<void *>(ic));
+        if (ic) {
+            ic->forwardKey(Key(FcitxKey_space));
+        }
+    }
+
+    void cancelHold(bool emitSpace) {
+        holdTimer_.reset();
+        holdProbe_.reset();
+        if (emitSpace) {
+            holdEmitSpace();
+        }
+    }
+
+    void armHoldProbe() {
+        holdProbe_ = instance_->eventLoop().addTimeEvent(
+            CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + kProbeUs, 100000,
+            [this](EventSourceTime *, uint64_t) {
+                holdProbe_.reset();
+                if (!holdTimer_) {
+                    return false;
+                }
+                const auto idle = now(CLOCK_MONOTONIC) - lastSpaceAt_;
+                if (idle <= kSilenceUs) {
+                    armHoldProbe();  // repeats keep arriving: still holding
+                    return false;
+                }
+                fprintf(stderr,
+                        "[voiceinput] hold: silent for %llums, short press\n",
+                        static_cast<unsigned long long>(idle / 1000));
+                deferHold([this] { cancelHold(true); });
+                return false;
+            });
+    }
+
+    void armHoldWatchdog() {
+        holdWatchdog_ = instance_->eventLoop().addTimeEvent(
+            CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + kWatchdogUs, 100000,
+            [this](EventSourceTime *, uint64_t) {
+                // Self-reset before any re-arm: assigning over the source
+                // whose callback is still running would destroy it mid-use.
+                holdWatchdog_.reset();
+                if (!recording_ || !holdStarted_) {
+                    return false;
+                }
+                if (now(CLOCK_MONOTONIC) - lastSpaceAt_ <= kWatchdogUs) {
+                    armHoldWatchdog();
+                    return false;
+                }
+                fprintf(stderr,
+                        "[voiceinput] hold: recording key released, "
+                        "finalizing\n");
+                deferHold([this] {
+                    if (recording_ && holdStarted_ && !interrupted_) {
+                        finalizeRecording();
+                    }
+                });
+                return false;
+            });
+    }
+
+    void handleHoldSpace(KeyEvent &keyEvent) {
+        const auto &key = keyEvent.key();
+        const bool isPlainSpace =
+            key.check(Key(FcitxKey_space)) &&
+            (key.states() & KeyState::SimpleMask) == 0;
+        if (!isPlainSpace) {
+            if (!keyEvent.isRelease() && holdTimer_ && key.isSimple()) {
+                // Typing resumed before the probe ran: flush the pending
+                // space of the previous short press right away.
+                cancelHold(true);
+            }
+            if (!keyEvent.isRelease() &&
+                key.checkKeyList(config_.triggerKey.value())) {
+                trigger(keyEvent.inputContext());
+                keyEvent.filterAndAccept();
+                return;
+            }
+            if (!keyEvent.isRelease() && recording_ && !interrupted_) {
+                editWhileRecording(keyEvent);
+            }
+            return;
+        }
+        const auto nowUs = now(CLOCK_MONOTONIC);
+        const bool isRepeat =
+            keyEvent.origKey().states().test(KeyState::Repeat) ||
+            key.states().test(KeyState::Repeat);
+        fprintf(stderr,
+                "[voiceinput] space: rel=%d rep=%d state=%s\n",
+                keyEvent.isRelease() ? 1 : 0, isRepeat ? 1 : 0,
+                recording_ ? (holdStarted_ ? "recording" : "rec-hotkey")
+                           : (holdTimer_ ? "waiting" : "idle"));
+        // Physical space state as of this event. The deferred start consults
+        // it so a release that slipped past the threshold never spawns a
+        // ghost session.
+        spaceDown_ = !keyEvent.isRelease();
+
+        if (keyEvent.isRelease()) {
+            if (holdTimer_) {
+                // Short press, and releases do arrive: fastest path.
+                keyEvent.filterAndAccept();
+                fprintf(stderr, "[voiceinput] space: act=emit\n");
+                cancelHold(true);
+                return;
+            }
+            if (recording_ && holdStarted_ && !interrupted_) {
+                keyEvent.filterAndAccept();
+                holdWatchdog_.reset();
+                fprintf(stderr, "[voiceinput] space: act=finalize\n");
+                finalizeRecording();
+            } else {
+                fprintf(stderr, "[voiceinput] space: act=rel-pass\n");
+            }
+            return;
+        }
+
+        // Bare space press.
+        if (!recording_ && !holdPendingStart_ && keyEvent.inputContext()) {
+            auto &panel = keyEvent.inputContext()->inputPanel();
+            if (panel.candidateList() || !panel.preedit().empty() ||
+                !panel.clientPreedit().empty()) {
+                // A preedit / candidate window belongs to the input
+                // method (e.g. pinyin: space picks the highlighted
+                // candidate). Never hijack that - and drop any hold that
+                // was still pending.
+                fprintf(stderr, "[voiceinput] space: act=composing\n");
+                cancelHold(false);
+                return;
+            }
+        }
+        if (holdPendingStart_) {
+            // Threshold fired and startSession is queued: swallow repeats
+            // so they do not restart the hold timer meanwhile.
+            keyEvent.filterAndAccept();
+            lastSpaceAt_ = nowUs;
+            fprintf(stderr, "[voiceinput] space: act=pending\n");
+            return;
+        }
+        if (recording_ && holdStarted_ && !interrupted_) {
+            // Key activity proves the key is still held; silence (0.7s)
+            // or a real release event ends the session.
+            keyEvent.filterAndAccept();
+            lastSpaceAt_ = nowUs;
+            armHoldWatchdog();
+            fprintf(stderr, "[voiceinput] space: act=keepalive\n");
+            return;
+        }
+        if (recording_) {
+            // Hotkey session: the space is dictated text. A finalizing
+            // (interrupted_) session must not arm a hold - its threshold
+            // would fire a stray recording after the session ended.
+            keyEvent.filterAndAccept();
+            if (!interrupted_) {
+                fprintf(stderr, "[voiceinput] space: act=dictate\n");
+                editWhileRecording(keyEvent);
+            } else {
+                fprintf(stderr, "[voiceinput] space: act=swallow\n");
+            }
+            return;
+        }
+        if (holdTimer_) {
+            if (isRepeat || nowUs - lastSpaceAt_ < kFlaglessRepeatUs) {
+                // Still the same hold: a flagged repeat, or a flag-less
+                // repeat too fast to be a human keypress.
+                keyEvent.filterAndAccept();
+                lastSpaceAt_ = nowUs;
+                fprintf(stderr, "[voiceinput] space: act=hold\n");
+                return;
+            }
+            // A fresh non-repeat press: the previous hold already ended
+            // without a release event - it was a short press, emit its
+            // pending space now.
+            keyEvent.filterAndAccept();
+            fprintf(stderr, "[voiceinput] space: act=flush\n");
+            cancelHold(true);
+        } else {
+            keyEvent.filterAndAccept();
+        }
+        // A brand new pending hold.
+        if (auto *ic = keyEvent.inputContext()) {
+            holdIcUuid_ = ic->uuid();
+        }
+        lastSpaceAt_ = nowUs;
+        fprintf(stderr, "[voiceinput] space: act=arm\n");
+        holdTimer_ = instance_->eventLoop().addTimeEvent(
+            CLOCK_MONOTONIC,
+            nowUs +
+                static_cast<uint64_t>(config_.holdMs.value()) * 1000,
+            0,
+            [this](EventSourceTime *, uint64_t) {
+                holdTimer_.reset();
+                holdProbe_.reset();
+                if (recording_ || holdPendingStart_) {
+                    return false;
+                }
+                if (now(CLOCK_MONOTONIC) - lastSpaceAt_ > kSilenceUs) {
+                    // The key went up before the threshold and no release
+                    // event ever arrived: emit the pending space.
+                    deferHold([this] { holdEmitSpace(); });
+                    return false;
+                }
+                fprintf(stderr, "[voiceinput] hold: threshold reached\n");
+                // Heavy IC work (capability changes, posix_spawn, IO
+                // source, panel updates) must not run inside the timer
+                // dispatch - defer it to the next loop iteration.
+                holdPendingStart_ = true;
+                deferHold([this] {
+                    holdPendingStart_ = false;
+                    if (!spaceDown_ || recording_) {
+                        // A release slipped in between the threshold and
+                        // this deferred start: never spawn a ghost session
+                        // for an already-released key.
+                        fprintf(stderr,
+                                "[voiceinput] hold: start aborted "
+                                "(spaceDown=%d recording=%d)\n",
+                                spaceDown_ ? 1 : 0, recording_ ? 1 : 0);
+                        return;
+                    }
+                    auto *ic = instance_->inputContextManager().findByUUID(
+                        holdIcUuid_);
+                    if (!ic || !ic->hasFocus()) {
+                        return;
+                    }
+                    startSession(ic);
+                    if (recording_) {
+                        // Session belongs to the held space key: enable
+                        // the release watchdog (release events may never
+                        // arrive).
+                        holdStarted_ = true;
+                        lastSpaceAt_ = now(CLOCK_MONOTONIC);
+                        armHoldWatchdog();
+                    }
+                });
+                return false;
+            });
+        armHoldProbe();
     }
 
     void startSession(InputContext *ic) {
@@ -412,7 +721,6 @@ private:
         payloadKind_ = PayloadKind::Commit;
         hasPartial_ = false;
         lastByte_ = 0;
-        idleRemain_ = config_.maxSeconds.value();
         statusNote_.clear();
 
         int pipefd[2];
@@ -430,8 +738,6 @@ private:
         args.push_back(languageCode(config_.language.value()));
         args.push_back("--model");
         args.push_back(modelCode(config_.model.value()));
-        args.push_back("--max-ms");
-        args.push_back(std::to_string(config_.maxSeconds.value() * 1000));
         args.push_back("--silence-ms");
         args.push_back(std::to_string(config_.silenceMs.value()));
         if (config_.useItn.value()) {
@@ -514,7 +820,10 @@ private:
                 return ioCallback(fd, flags);
             });
         showStatus(std::string("🎤 ") + _("Recording") + " 0s (" +
-                   _("press trigger key to stop") + ")");
+                   (config_.triggerMode.value() == TriggerMode::HoldSpace
+                        ? _("release Space to stop")
+                        : _("press trigger key to stop")) +
+                   ")");
         scheduleTick();
     }
 
@@ -548,6 +857,8 @@ private:
     void finishSession() {
         ioSource_.reset();
         tickTimer_.reset();
+        holdWatchdog_.reset();
+        holdStarted_ = false;
         recording_ = false;
 
         // Reap the child.
@@ -602,6 +913,8 @@ private:
         ioSource_.reset();
         tickTimer_.reset();
         errorTimer_.reset();
+        holdWatchdog_.reset();
+        holdStarted_ = false;
         recording_ = false;
         clearPreedit();
         restoreCaps();
@@ -622,7 +935,6 @@ private:
     //   PARTIAL\n<text>\n  draft of the current phrase -> show as preedit
     //   COMMIT\n<text>\n   final text of one VAD segment -> drop the
     //                      preedit and commit into the application
-    //   TICK\n<sec>\n      seconds left before the idle auto-stop
     //   STATUS\n<msg>\n    panel note (model download/loading); "" clears
     //   ERROR\n<msg>\n     fatal error -> show message
     //   NEWLINE\n          line break requested via Enter (no payload)
@@ -655,9 +967,6 @@ private:
                     }
                     clearPreedit();
                     break;
-                case PayloadKind::Tick:
-                    idleRemain_ = std::atoi(line.c_str());
-                    break;
                 case PayloadKind::Status:
                     statusNote_ = line;
                     showStatus(recordingStatus());
@@ -669,9 +978,6 @@ private:
             } else if (line == "COMMIT") {
                 expectPayload_ = true;
                 payloadKind_ = PayloadKind::Commit;
-            } else if (line == "TICK") {
-                expectPayload_ = true;
-                payloadKind_ = PayloadKind::Tick;
             } else if (line == "STATUS") {
                 expectPayload_ = true;
                 payloadKind_ = PayloadKind::Status;
@@ -741,7 +1047,7 @@ private:
     void showTransient(const std::string &message) {
         showStatus(message);
         errorTimer_ = instance_->eventLoop().addTimeEvent(
-            CLOCK_MONOTONIC, 2500000, 100000,
+            CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + 2500000, 100000,
             [this](EventSourceTime *, uint64_t) {
                 auto *ic = findIc();
                 if (ic) {
@@ -764,7 +1070,21 @@ private:
     std::unique_ptr<EventSourceIO> ioSource_;
     std::unique_ptr<EventSourceTime> tickTimer_;
     std::unique_ptr<EventSourceTime> errorTimer_;
+    std::unique_ptr<EventSourceTime> holdTimer_;
+    std::unique_ptr<EventSourceTime> holdProbe_;
+    std::unique_ptr<EventSourceTime> holdWatchdog_;
+    std::unique_ptr<EventSourceTime> holdDefer_;
     ICUUID icUuid_{};
+    ICUUID holdIcUuid_{};
+    uint64_t lastSpaceAt_ = 0;
+    // True only for sessions started by holding space (they end on key
+    // release / repeat silence); hotkey sessions are unaffected.
+    bool holdStarted_ = false;
+    // Threshold fired but startSession is still queued via deferHold();
+    // swallow leftover space repeats so they do not restart the timer.
+    bool holdPendingStart_ = false;
+    // Latest known physical state of the space key in HoldSpace mode.
+    bool spaceDown_ = false;
     pid_t child_ = -1;
     int outFd_ = -1;
     std::string buffer_;
@@ -777,9 +1097,8 @@ private:
     signed char lastByte_ = 0;
 
     // Kind of the payload line announced by the preceding tag line.
-    enum class PayloadKind { Commit, Preedit, Error, Tick, Status };
+    enum class PayloadKind { Commit, Preedit, Error, Status };
     PayloadKind payloadKind_ = PayloadKind::Commit;
-    int idleRemain_ = 30;
     std::string statusNote_;
     CapabilityFlags savedCaps_{};
     bool capsForced_ = false;

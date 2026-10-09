@@ -15,6 +15,18 @@ msgstr ""
 msgid "Trigger Key"
 msgstr "触发快捷键"
 
+msgid "Trigger Mode"
+msgstr "触发方式"
+
+msgid "HotkeyToggle"
+msgstr "热键开关"
+
+msgid "HoldSpace"
+msgstr "长按空格说话（默认）"
+
+msgid "Hold Space Milliseconds to Start"
+msgstr "长按空格多少毫秒后开始（500-10000）"
+
 msgid "Recognition Language"
 msgstr "识别语言"
 
@@ -38,9 +50,6 @@ msgstr "（已缓存）"
 
 msgid " · not cached"
 msgstr "（未缓存，选择后自动下载）"
-
-msgid "Auto-stop Idle Seconds (no new text)"
-msgstr "空闲自动停止（秒，无新文字时计时）"
 
 msgid "Sentence Pause (ms; draft commits on pause)"
 msgstr "断句停顿（毫秒，停顿后草稿上屏）"
@@ -69,8 +78,8 @@ msgstr "录音中"
 msgid "press trigger key to stop"
 msgstr "再按快捷键结束"
 
-msgid "idle auto stop"
-msgstr "无文字自动结束"
+msgid "release Space to stop"
+msgstr "松开空格结束"
 
 msgid "Recognizing..."
 msgstr "识别中…"
