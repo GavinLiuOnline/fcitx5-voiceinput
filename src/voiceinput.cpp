@@ -476,19 +476,23 @@ private:
     // Wayland: a swallowed short space press never reappears). Re-emit the
     // text via commit there; immodule frontends keep the key forward so
     // the spacebar semantics (page scrolling, button activation) survive.
-    bool frontendNeedsCommit(InputContext *ic) {
-        const char *fe = ic ? ic->frontend() : nullptr;
+    bool frontendNeedsCommit(const char *fe) {
         return fe && (strcmp(fe, "xim") == 0 || strcmp(fe, "waylandim") == 0);
     }
 
     void holdEmitSpace() {
         auto *ic = instance_->inputContextManager().findByUUID(holdIcUuid_);
-        fprintf(stderr, "[voiceinput] hold: emitting space (ic=%p)\n",
-                static_cast<void *>(ic));
         if (!ic) {
+            fprintf(stderr, "[voiceinput] hold: emitting space: no ic\n");
             return;
         }
-        if (frontendNeedsCommit(ic)) {
+        const char *fe = ic->frontend();
+        const bool viaCommit = frontendNeedsCommit(fe);
+        fprintf(stderr,
+                "[voiceinput] hold: emitting space (ic=%p fe=%s via=%s)\n",
+                static_cast<void *>(ic), fe ? fe : "?",
+                viaCommit ? "commit" : "forward");
+        if (viaCommit) {
             ic->commitString(" ");
         } else {
             ic->forwardKey(Key(FcitxKey_space));
