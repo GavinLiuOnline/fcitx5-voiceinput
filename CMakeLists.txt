@@ -86,7 +86,9 @@ set(CPACK_DEBIAN_PACKAGE_MAINTAINER
     "fcitx5-voiceinput contributors <noreply@example.com>")
 set(CPACK_DEBIAN_PACKAGE_SECTION "utils")
 set(CPACK_DEBIAN_PACKAGE_DEPENDS
-    "fcitx5, python3, python3-numpy, alsa-utils | pipewire-utils")
+    "fcitx5, python3, python3-pip, python3-numpy, alsa-utils | pipewire-utils")
+set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
+    "${CMAKE_CURRENT_SOURCE_DIR}/debian/postinst")
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
 set(CPACK_OUTPUT_FILE_PREFIX "${CMAKE_BINARY_DIR}/dist")

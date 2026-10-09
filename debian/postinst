@@ -1,0 +1,20 @@
+#!/bin/sh
+# sherpa-onnx only ships on PyPI (no Ubuntu archive package), so the deb
+# installs it at package-setup time. A pip failure (offline machine, no
+# pip) must not fail the package install itself: the backend prints the
+# manual command when the import is missing.
+set -e
+
+FLAGS=""
+if ls /usr/lib/python3*/EXTERNALLY-MANAGED >/dev/null 2>&1; then
+    # Ubuntu 23.04+ / Debian 12 mark the system env as externally managed
+    # (PEP 668); a plain pip install is refused without this flag.
+    FLAGS="--break-system-packages"
+fi
+
+if ! python3 -m pip install $FLAGS sherpa-onnx >/dev/null 2>&1; then
+    echo "fcitx5-voiceinput: auto-install of sherpa-onnx failed." >&2
+    echo "  please run manually: python3 -m pip install $FLAGS sherpa-onnx" >&2
+fi
+
+exit 0
