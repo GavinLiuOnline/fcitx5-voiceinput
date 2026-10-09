@@ -116,7 +116,7 @@ Options are under **fcitx5-configtool → Addons → Voice Input**:
 | --- | --- | --- |
 | Trigger Mode | Hold space | `Hotkey toggle`: press the hotkey to start/stop. `Hold space`: hold **Space** for the configured duration to start, release to stop |
 | Trigger Key | `Ctrl+Alt+V` | Hotkey to start/stop a session (hotkey mode; also works as a fallback in hold-space mode) |
-| Hold Space Milliseconds to Start | 2500 | Hold-space mode: milliseconds to hold Space before recording starts (500-10000); a shorter press types a normal space |
+| Hold Space Milliseconds to Start | 1000 | Hold-space mode: milliseconds to hold Space before recording starts (500-10000); a shorter press types a normal space |
 | Recognition Language | Auto | auto / zh / en / ja / ko / yue |
 | Recognition Model | SenseVoice Small | See "Recognition models" below |
 | Keys while recording | — | `Esc` finish; `Enter` insert a newline; `BackSpace` delete the last committed character; letters/digits/punctuation are typed straight into the text field |

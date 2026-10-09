@@ -171,7 +171,7 @@ FCITX_CONFIGURATION(
     // fcitx-config has no double marshalling, so the hold duration is an
     // int in milliseconds.
     Option<int, IntConstrain> holdMs{
-        this, "HoldMs", _("Hold Space Milliseconds to Start"), 2500,
+        this, "HoldMs", _("Hold Space Milliseconds to Start"), 1000,
         IntConstrain(500, 10000)};
     Option<VoiceLanguage> language{this, "Language", _("Recognition Language"),
                                    VoiceLanguage::Auto};
