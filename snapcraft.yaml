@@ -23,6 +23,9 @@ confinement: classic
 parts:
   voiceinput:
     plugin: nil
+    # Without an explicit source, the nil plugin copies nothing into the
+    # part's src dir and the build scriptlet finds no CMakeLists.txt.
+    source: .
     build-packages:
       - cmake
       - g++
