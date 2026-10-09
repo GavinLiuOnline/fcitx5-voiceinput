@@ -32,7 +32,9 @@ parts:
       - libfcitx5config-dev
       - libfcitx5utils-dev
     override-build: |
-      cmake -B build -DCMAKE_BUILD_TYPE=Release \
+      # The build scriptlet runs in the (empty) part build dir; the source
+      # tree is in SNAPCRAFT_PART_SRC, so point cmake at it explicitly.
+      cmake -S "$SNAPCRAFT_PART_SRC" -B build -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DVOICEINPUT_RELOCATABLE=ON
       cmake --build build -j"$(nproc)"
