@@ -120,7 +120,7 @@ def _open_following_redirects(req: urllib.request.Request, timeout: int):
     raise IOError("重定向次数过多")
 
 
-def _download_once(url: str, dest: Path) -> None:
+def _download_once(url: str, dest: Path, on_progress=None) -> None:
     part = dest.with_suffix(dest.suffix + ".part")
     part.parent.mkdir(parents=True, exist_ok=True)
     have = part.stat().st_size if part.is_file() else 0
@@ -155,20 +155,22 @@ def _download_once(url: str, dest: Path) -> None:
                         print(f"\r    {pct:3d}%  {done / 1e6:7.1f} / "
                               f"{total / 1e6:.1f} MB",
                               end="", file=sys.stderr, flush=True)
+                        if on_progress:
+                            on_progress(pct)
     print(file=sys.stderr)
     if total and done < total:
         raise IOError(f"连接中断于 {done / 1e6:.1f}/{total / 1e6:.1f} MB")
     part.rename(dest)
 
 
-def download(url: str, dest: Path, attempts: int = 5) -> None:
+def download(url: str, dest: Path, attempts: int = 5, on_progress=None) -> None:
     if MIRROR and url.startswith("https://github.com/"):
         url = MIRROR + "/" + url
     print(f"    下载 {url}", file=sys.stderr)
     last_err = None
     for _ in range(attempts):
         try:
-            _download_once(url, dest)
+            _download_once(url, dest, on_progress)
             return
         except Exception as e:  # noqa: BLE001
             last_err = e
@@ -176,11 +178,12 @@ def download(url: str, dest: Path, attempts: int = 5) -> None:
     raise last_err
 
 
-def download_first(filename: str, dest: Path, sources) -> bool:
+def download_first(filename: str, dest: Path, sources,
+                   on_progress=None) -> bool:
     """Try each source URL base until one succeeds."""
     for base in sources:
         try:
-            download(f"{base}/{filename}", dest)
+            download(f"{base}/{filename}", dest, on_progress=on_progress)
             return True
         except Exception as e:  # noqa: BLE001
             print(f"    源 {base} 失败: {e}", file=sys.stderr)
@@ -323,6 +326,52 @@ def emit_status(msg: str) -> None:
     print(msg, flush=True)
 
 
+_notify_id = 0
+
+
+def notify_desktop(body: str, sticky: bool = False) -> None:
+    """Show a desktop notification, replacing the previous one.
+
+    Best effort: silently no-op without a session bus (uses gdbus, which
+    ships with every glib-based desktop). Progress updates reuse the same
+    replaces_id so the notification does not spam the tray. sticky=True
+    keeps the notification until dismissed (used for success/failure).
+    """
+    global _notify_id
+    if not shutil.which("gdbus"):
+        return
+    try:
+        out = subprocess.run(
+            ["gdbus", "call", "--session",
+             "--dest", "org.freedesktop.Notifications",
+             "--object-path", "/org/freedesktop/Notifications",
+             "--method", "org.freedesktop.Notifications.Notify",
+             "fcitx5-voiceinput", str(_notify_id), "audio-input-microphone",
+             "语音输入模型下载", body, "[]", "{}",
+             "0" if sticky else "8000"],
+            capture_output=True, text=True, timeout=5)
+        if out.returncode != 0:
+            print(f"[voice] 通知发送失败: {out.stderr.strip()}", file=sys.stderr)
+            return
+        m = re.search(r"uint32\s+(\d+)", out.stdout)
+        if m and m.group(1) != "0":
+            _notify_id = int(m.group(1))
+    except Exception as e:  # noqa: BLE001
+        print(f"[voice] 通知发送失败: {e}", file=sys.stderr)
+
+
+def make_progress_notifier(prefix: str):
+    """One desktop notification per 20% step, all replacing each other."""
+    state = [-1]
+
+    def on_progress(pct: int) -> None:
+        if pct // 20 > state[0] // 20 or pct == 100:
+            state[0] = pct
+            notify_desktop(f"{prefix}… {pct}%")
+
+    return on_progress
+
+
 def model_entry(model_id: str) -> dict:
     return MODEL_REGISTRY.get(model_id, MODEL_REGISTRY[DEFAULT_MODEL_ID])
 
@@ -372,7 +421,8 @@ def ensure_vad(model_dir: Path) -> bool:
     return True
 
 
-def prepare_offline_model(model_id: str, model_dir: Path) -> bool:
+def prepare_offline_model(model_id: str, model_dir: Path,
+                          on_progress=None) -> bool:
     """Serialize model preparation across processes (doctor + sessions)."""
     model_dir.mkdir(parents=True, exist_ok=True)
     lock_fd = open(model_dir / ".download.lock", "w")
@@ -380,16 +430,75 @@ def prepare_offline_model(model_id: str, model_dir: Path) -> bool:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
+            # Someone else is downloading. If the model is meanwhile
+            # complete on disk (and VAD is present), use it directly
+            # instead of waiting for the lock.
+            if (find_offline_model(model_id, model_dir) is not None
+                    and (model_dir / "silero_vad.onnx").is_file()):
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                lock_fd.close()
+                return True
             emit_status("识别模型正在后台下载，请稍候…")
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             emit_status("")
-        return _prepare_offline_locked(model_id, model_dir)
+        return _prepare_offline_locked(model_id, model_dir, on_progress)
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         lock_fd.close()
 
 
-def _prepare_offline_locked(model_id: str, model_dir: Path) -> bool:
+def spawn_detached_download(model_id: str, model_dir: Path) -> None:
+    """Start a detached `download` child, unless one is already running.
+
+    Double-fork so the downloader is reparented to init and survives the
+    session being killed (Esc / hotkey / focus loss must not abort the
+    download).
+    """
+    model_dir.mkdir(parents=True, exist_ok=True)
+    probe = os.open(model_dir / ".download.lock", os.O_WRONLY | os.O_CREAT)
+    try:
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return  # a download is already running; nothing to spawn
+        fcntl.flock(probe, fcntl.LOCK_UN)
+    finally:
+        os.close(probe)
+    try:
+        pid = os.fork()
+    except OSError:
+        return
+    if pid == 0:
+        try:
+            os.setsid()
+            if os.fork() == 0:
+                argv = [sys.executable, "-u", str(Path(__file__).resolve()),
+                        "download", "--model", model_id]
+                os.execvp(argv[0], argv)
+        except BaseException:  # noqa: BLE001
+            pass
+        os._exit(127)
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+
+
+def wait_model_ready(model_id: str, model_dir: Path,
+                     timeout_s: int = 1800) -> bool:
+    """Poll until the model + VAD are complete on disk (or timeout)."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if (find_offline_model(model_id, model_dir) is not None
+                and (model_dir / "silero_vad.onnx").is_file()):
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(2)
+
+
+def _prepare_offline_locked(model_id: str, model_dir: Path,
+                            on_progress=None) -> bool:
     """Make sure the selected offline model + VAD exist, downloading if not."""
     if not ensure_vad(model_dir):
         return False
@@ -412,7 +521,7 @@ def _prepare_offline_locked(model_id: str, model_dir: Path) -> bool:
             int8.unlink()
         if not int8.is_file():
             if not download_first(f"{hf_repo}/resolve/main/model.int8.onnx",
-                                  int8, HF_BASES):
+                                  int8, HF_BASES, on_progress=on_progress):
                 print("    回退到完整压缩包...", file=sys.stderr)
             elif not tokens.is_file():
                 download_first(f"{hf_repo}/resolve/main/tokens.txt",
@@ -421,11 +530,13 @@ def _prepare_offline_locked(model_id: str, model_dir: Path) -> bool:
         archive = model_dir / (entry["dirname"] + ".tar.bz2")
         if not archive.is_file() or archive.stat().st_size < 1_000_000:
             try:
-                download(f"{BASE_URL}/{entry['dirname']}.tar.bz2", archive)
+                download(f"{BASE_URL}/{entry['dirname']}.tar.bz2", archive,
+                         on_progress=on_progress)
             except Exception as e:  # noqa: BLE001
                 print(f"    ✘ 下载识别模型失败: {e}", file=sys.stderr)
                 emit_status("模型下载失败，请检查网络")
                 return False
+        emit_status("正在解压模型…")
         print("    解压中...", file=sys.stderr)
         try:
             with tarfile.open(archive, "r:bz2") as tar:
@@ -560,19 +671,31 @@ def cmd_session(args) -> int:
         return 1
 
     try:
-        # First use of a freshly selected model: download on the fly. Mic
-        # audio is already buffering in memory, so nothing is lost.
+        # First use of a freshly selected model: hand the download to a
+        # detached background process, so it survives this session (Esc /
+        # hotkey / focus change must not abort it). Mic audio keeps
+        # buffering while the session waits for the model to appear; the
+        # downloader reports its own progress as desktop notifications.
         if find_offline_model(args.model, model_dir) is None:
-            if not prepare_offline_model(args.model, model_dir):
+            spawn_detached_download(args.model, model_dir)
+            emit_status("正在后台下载模型，请稍候…（结束录音不会中断下载）")
+            if not wait_model_ready(args.model, model_dir):
+                notify_desktop("模型下载失败，请检查网络后重试", sticky=True)
                 if rec:
                     rec.close()
                 print("ERROR\n模型下载失败，请检查网络或手动运行 doctor",
                       flush=True)
                 return 1
+            emit_status("")
         emit_status("正在加载识别模型…")
         recognizer = load_offline_recognizer(
             sherpa_onnx, args.model, model_dir, args.lang, args.itn)
         emit_status("")
+    except KeyboardInterrupt:
+        if rec:
+            rec.close()
+        print("DONE", flush=True)
+        return 0
     except Exception as e:  # noqa: BLE001
         if rec:
             rec.close()
@@ -840,6 +963,32 @@ def verify_models(model_dir: Path, model_id: str) -> bool:
     return ok
 
 
+def cmd_download(args) -> int:
+    """Download one recognition model, or no-op when already complete.
+
+    Used by the addon to prefetch a model right after the user picks it in
+    fcitx5-configtool, and by users who want to pre-download from the CLI.
+    Progress is reported as desktop notifications, so it stays visible even
+    when launched in the background from fcitx5.
+    """
+    # No session protocol here; route STATUS notes and progress to stderr.
+    sys.stdout = sys.stderr
+    model_dir = Path(args.model_dir) if args.model_dir else DEFAULT_MODEL_DIR
+    if find_offline_model(args.model, model_dir) is not None:
+        print(f"模型已缓存: {args.model}", file=sys.stderr)
+        return 0
+    entry = model_entry(args.model)
+    notify_desktop(f"开始下载 {args.model}（{entry['size']}）…")
+    if not prepare_offline_model(args.model, model_dir,
+                                 on_progress=make_progress_notifier(
+                                     f"下载 {args.model}")):
+        notify_desktop("模型下载失败，请检查网络后重试", sticky=True)
+        return 1
+    notify_desktop("模型下载完成，可以开始语音输入了", sticky=True)
+    print(f"模型就绪: {args.model}", file=sys.stderr)
+    return 0
+
+
 def cmd_doctor(args) -> int:
     model_dir = Path(args.model_dir) if args.model_dir else DEFAULT_MODEL_DIR
     entry = model_entry(args.model)
@@ -894,6 +1043,12 @@ def main() -> int:
     p_doc.add_argument("--model", default=DEFAULT_MODEL_ID,
                        choices=MODEL_CHOICES)
 
+    p_dl = sub.add_parser("download",
+                          help="下载指定识别模型（已缓存则跳过）")
+    p_dl.add_argument("--model-dir", default=None)
+    p_dl.add_argument("--model", default=DEFAULT_MODEL_ID,
+                      choices=MODEL_CHOICES)
+
     p_sess = sub.add_parser("session", help="执行一次语音输入会话")
     p_sess.add_argument("--model", default=DEFAULT_MODEL_ID,
                         choices=MODEL_CHOICES)
@@ -911,6 +1066,8 @@ def main() -> int:
     try:
         if args.cmd == "doctor":
             return cmd_doctor(args)
+        if args.cmd == "download":
+            return cmd_download(args)
         return cmd_session(args)
     except KeyboardInterrupt:
         print("ERROR\n已取消", flush=True)

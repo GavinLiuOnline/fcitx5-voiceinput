@@ -1,0 +1,44 @@
+name: fcitx5-voiceinput
+base: core22
+version: "1.0.0"
+summary: Local voice input addon for fcitx5 (installer snap)
+description: |
+  Press a hotkey, speak, and the recognized text is typed into the focused
+  application. Speech recognition (SenseVoice / Paraformer / Whisper /
+  FireRedASR via sherpa-onnx) and endpoint detection (Silero VAD) run
+  completely locally - no cloud service, no audio ever leaves your machine.
+
+  fcitx5 loads addons only from its own system directories, so this is a
+  CLASSIC snap carrying the prebuilt addon. Install it into your system
+  fcitx5 with:
+
+      sudo snap install fcitx5-voiceinput --classic
+      fcitx5-voiceinput.install-addon
+
+  System requirements: fcitx5 >= 5.0; python3 with numpy
+  (`pip3 install --user sherpa-onnx`); a microphone.
+grade: stable
+confinement: classic
+
+parts:
+  voiceinput:
+    plugin: nil
+    build-packages:
+      - cmake
+      - g++
+      - pkg-config
+      - gettext
+      - libfcitx5core-dev
+      - libfcitx5config-dev
+      - libfcitx5utils-dev
+    override-build: |
+      cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DVOICEINPUT_RELOCATABLE=ON
+      cmake --build build -j"$(nproc)"
+      cmake --install build --prefix "$SNAPCRAFT_PART_INSTALL/usr" --strip
+      ls "$SNAPCRAFT_PART_INSTALL"/usr/lib/*/fcitx5/fcitx5-voiceinput.so
+
+apps:
+  install-addon:
+    command: usr/share/fcitx5/voiceinput/install-snap-addon.sh

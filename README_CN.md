@@ -50,6 +50,23 @@
 
 ## 安装
 
+### 从安装包安装
+
+从 [Releases](../../releases) 页面下载 `fcitx5-voiceinput_<版本>_amd64.deb`
+或 snap 包（推送 `v*` 标签后 CI 会自动构建两者并发布）：
+
+```bash
+# deb（Ubuntu 22.04+）
+sudo apt install ./fcitx5-voiceinput_1.0.0_amd64.deb
+pip3 install --user sherpa-onnx    # ASR 引擎（apt 不打包，需手动装一次）
+
+# snap（classic 安装器 snap）
+sudo snap install fcitx5-voiceinput --classic
+fcitx5-voiceinput.install-addon    # 把插件复制进系统 fcitx5 目录
+```
+
+### 从源码安装
+
 ```bash
 git clone <本仓库>
 cd fcitx5-voiceinput
@@ -95,7 +112,12 @@ fcitx5 -r                        # 重启 fcitx5
 
 ### 识别模型
 
-在 fcitx5-configtool 中选择，首次使用会**自动下载**（录音先缓冲，不丢字）：
+在 fcitx5-configtool 的下拉框中选择，每个选项实时标注本地缓存状态
+（已缓存 / 未缓存）。**切换到未缓存的模型会立即在后台下载**，第一次录音
+无需等待；若下载完成前就开始说话，录音会先缓冲、模型现场下载，不丢字。
+下载在**独立的后台进程**中进行，结束录音、切换焦点都不会中断下载。
+下载进度以**桌面通知**显示（每 20% 原位刷新，完成/失败各有提示），
+录音中触发的下载同时会在输入面板状态行显示等待提示：
 
 | 模型 | 语言 | 体积 | 说明 |
 | --- | --- | --- | --- |
@@ -104,7 +126,17 @@ fcitx5 -r                        # 重启 fcitx5
 | Whisper Base | 多语言 | 约 145 MB | OpenAI Whisper，CPU 上较慢 |
 | FireRed ASR Large | 中/英 | 约 1.2 GB | 小红书，高精度大模型 |
 
-也可预先下载：`python3 backend/voice_backend.py doctor --model paraformer-zh`
+也可命令行预下载：`python3 backend/voice_backend.py download --model paraformer-zh`
+
+## 发布版本
+
+推送 `v*` 标签即触发 release 工作流：自动构建 deb（CPack）与 snap
+（snapcraft）并附到 GitHub Release：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
 
 ## 命令行调试
 

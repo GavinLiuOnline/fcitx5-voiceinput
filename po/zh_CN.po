@@ -33,6 +33,12 @@ msgstr "Whisper Base（多语言，CPU 较慢）"
 msgid "FireRedASRLarge"
 msgstr "FireRed ASR Large（中英，高精度）"
 
+msgid " · cached"
+msgstr "（已缓存）"
+
+msgid " · not cached"
+msgstr "（未缓存，选择后自动下载）"
+
 msgid "Auto-stop Idle Seconds (no new text)"
 msgstr "空闲自动停止（秒，无新文字时计时）"
 

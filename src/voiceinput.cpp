@@ -8,6 +8,7 @@
  *
  * SPDX-License-Identifier: MIT
  */
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
@@ -75,9 +76,8 @@ enum class VoiceModel {
     WhisperBase,
     FireRedAsrLarge,
 };
-FCITX_CONFIG_ENUM_NAME_WITH_I18N(VoiceModel, "SenseVoiceSmall",
-                                 "ParaformerZh", "WhisperBase",
-                                 "FireRedASRLarge");
+FCITX_CONFIG_ENUM_NAME(VoiceModel, "SenseVoiceSmall", "ParaformerZh",
+                       "WhisperBase", "FireRedASRLarge");
 
 const char *modelCode(VoiceModel model) {
     switch (model) {
@@ -92,6 +92,68 @@ const char *modelCode(VoiceModel model) {
     }
 }
 
+// Model sub-directories, order matches the VoiceModel enum. Keep in sync
+// with MODEL_REGISTRY in backend/voice_backend.py.
+constexpr const char *kVoiceModelDirnames[] = {
+    "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+    "sherpa-onnx-paraformer-zh-2023-09-14",
+    "sherpa-onnx-whisper-base",
+    "sherpa-onnx-fire-red-asr-large-zh_en-2025-02-16",
+};
+
+// True when the model directory exists and holds at least one .onnx file,
+// mirroring what the backend's find_offline_model() accepts.
+bool voiceModelCached(size_t index, const std::string &modelDir) {
+    const char *xdg = std::getenv("XDG_DATA_HOME");
+    std::string base = (xdg && *xdg) ? xdg : std::string(std::getenv("HOME") ?
+                                                             std::getenv("HOME") :
+                                                             "") +
+                                       "/.local/share";
+    std::string dir = modelDir.empty()
+                          ? base + "/fcitx5-voiceinput/models/" +
+                                kVoiceModelDirnames[index]
+                          : modelDir + "/" + kVoiceModelDirnames[index];
+    DIR *d = ::opendir(dir.c_str());
+    if (!d) {
+        return false;
+    }
+    bool cached = false;
+    while (dirent *ent = ::readdir(d)) {
+        const size_t len = strlen(ent->d_name);
+        if (len > 5 && strcmp(ent->d_name + len - 5, ".onnx") == 0) {
+            cached = true;
+            break;
+        }
+    }
+    ::closedir(d);
+    return cached;
+}
+
+// Annotation that labels every model in the configtool combo box with its
+// live cache status, probed on disk each time fcitx5-configtool opens the
+// page (dumpDescription runs on every DBus GetConfig).
+struct VoiceModelStatusAnnotation {
+    // Points at the ModelDir option of the same config struct; only
+    // dereferenced much later, when dumpDescription runs.
+    const Option<std::string> *modelDirOption = nullptr;
+
+    bool skipDescription() { return false; }
+    bool skipSave() { return false; }
+    void dumpDescription(RawConfig &config) const {
+        const std::string modelDir =
+            modelDirOption ? modelDirOption->value() : std::string();
+        for (size_t i = 0; i < std::size(kVoiceModelDirnames); i++) {
+            std::string label = _(_VoiceModel_Names[i]);
+            label += voiceModelCached(i, modelDir) ? _(" · cached")
+                                                   : _(" · not cached");
+            config.setValueByPath("EnumI18n/" + std::to_string(i), label);
+        }
+    }
+    static std::string toString(VoiceModel value) {
+        return _(_VoiceModel_Names[static_cast<size_t>(value)]);
+    }
+};
+
 FCITX_CONFIGURATION(
     VoiceInputConfig,
     KeyListOption triggerKey{
@@ -99,8 +161,10 @@ FCITX_CONFIGURATION(
         KeyListConstrain({KeyConstrainFlag::AllowModifierOnly})};
     Option<VoiceLanguage> language{this, "Language", _("Recognition Language"),
                                    VoiceLanguage::Auto};
-    OptionWithAnnotation<VoiceModel, VoiceModelI18NAnnotation> model{
-        this, "Model", _("Recognition Model"), VoiceModel::SenseVoiceSmall};
+    OptionWithAnnotation<VoiceModel, VoiceModelStatusAnnotation> model{
+        this, "Model", _("Recognition Model"), VoiceModel::SenseVoiceSmall,
+        NoConstrain<VoiceModel>(), DefaultMarshaller<VoiceModel>(),
+        VoiceModelStatusAnnotation{&modelDir}};
     Option<int, IntConstrain> maxSeconds{
         this, "MaxSeconds", _("Auto-stop Idle Seconds (no new text)"), 6,
         IntConstrain(3, 120)};
@@ -214,7 +278,47 @@ public:
     }
 
     void reloadConfig() override {
+        const std::string prevModel =
+            configLoaded_ ? modelCode(config_.model.value()) : std::string();
         readAsIni(config_, "conf/fcitx5-voiceinput.conf");
+        if (!configLoaded_) {
+            // First load (addon startup), not a user edit.
+            configLoaded_ = true;
+            return;
+        }
+        // A different model was picked in fcitx5-configtool: prefetch it
+        // in the background right away, so the first dictation with the
+        // new model doesn't have to wait for a download. The backend is a
+        // no-op when the model is already complete on disk.
+        const auto cur = modelCode(config_.model.value());
+        if (cur != prevModel) {
+            spawnModelDownload(cur);
+        }
+    }
+
+    // Fire-and-forget `voice_backend.py download --model <id>`. Double
+    // fork so the worker is reparented to init and never becomes a zombie
+    // of the fcitx5 process.
+    void spawnModelDownload(const std::string &code) {
+        pid_t pid = ::fork();
+        if (pid < 0) {
+            return;
+        }
+        if (pid == 0) {
+            ::setsid();
+            const auto python = config_.python.value();
+            const auto backend = config_.backend.value();
+            const pid_t worker = ::fork();
+            if (worker == 0) {
+                ::execlp(python.c_str(), python.c_str(), "-u",
+                         backend.c_str(), "download", "--model", code.c_str(),
+                         static_cast<char *>(nullptr));
+                _exit(127);
+            }
+            _exit(0);
+        }
+        int status = 0;
+        ::waitpid(pid, &status, 0);
     }
 
     // Expose the configuration to fcitx5-configtool (DBus GetConfig).
@@ -652,6 +756,7 @@ private:
 
     Instance *instance_;
     VoiceInputConfig config_;
+    bool configLoaded_ = false;
     std::unique_ptr<HandlerTableEntry<EventHandler>> keyHandler_;
     std::unique_ptr<HandlerTableEntry<EventHandler>> icCreatedHandler_;
     std::unique_ptr<HandlerTableEntry<EventHandler>> focusHandler_;

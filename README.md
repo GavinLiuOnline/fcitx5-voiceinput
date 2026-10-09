@@ -59,6 +59,23 @@ service, no audio ever leaves your machine.
 
 ## Install
 
+### From packages
+
+Grab `fcitx5-voiceinput_<version>_amd64.deb` or the snap from the
+[Releases](../../releases) page (CI builds both for every `v*` tag).
+
+```bash
+# deb (Ubuntu 22.04+)
+sudo apt install ./fcitx5-voiceinput_1.0.0_amd64.deb
+pip3 install --user sherpa-onnx    # ASR engine (not packaged by apt)
+
+# snap (classic installer snap)
+sudo snap install fcitx5-voiceinput --classic
+fcitx5-voiceinput.install-addon    # copies the addon into system fcitx5
+```
+
+### From source
+
 ```bash
 git clone <this repo>
 cd fcitx5-voiceinput
@@ -107,8 +124,16 @@ Options are under **fcitx5-configtool → Addons → Voice Input**:
 
 ### Recognition models
 
-Pick one in fcitx5-configtool; the first use **downloads it automatically**
-(mic audio is buffered meanwhile, nothing is lost):
+Pick one in the fcitx5-configtool combo box — every entry is labeled with
+its live cache status ("cached" / "not cached"). Switching to a model that
+is not cached **starts a background download immediately**, so the first
+dictation with it doesn't wait. If you start talking before the download
+finishes, mic audio is buffered meanwhile — nothing is lost. Downloads run
+in a **detached background process**: ending a dictation (Esc, hotkey or
+focus change) never aborts them. Progress shows as **desktop
+notifications** (updated in place every 20%, plus a final success/failure
+notice); a download triggered mid-dictation also shows a waiting note on
+the input-panel status line:
 
 | Model | Languages | Size | Notes |
 | --- | --- | --- | --- |
@@ -117,7 +142,17 @@ Pick one in fcitx5-configtool; the first use **downloads it automatically**
 | Whisper Base | multilingual | ~145 MB | OpenAI Whisper, slower on CPU |
 | FireRed ASR Large | zh/en | ~1.2 GB | High accuracy |
 
-Pre-download via CLI: `python3 backend/voice_backend.py doctor --model paraformer-zh`
+Pre-download via CLI: `python3 backend/voice_backend.py download --model paraformer-zh`
+
+## Releasing
+
+Pushing a `v*` tag runs the release workflow, which builds the deb (CPack)
+and the snap (snapcraft) and attaches them to a GitHub Release:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
 
 ## CLI debugging
 

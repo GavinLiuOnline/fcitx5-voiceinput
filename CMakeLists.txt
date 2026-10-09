@@ -13,8 +13,17 @@ pkg_check_modules(FCITX5CORE REQUIRED IMPORTED_TARGET Fcitx5Core)
 # library must be installed next to the running fcitx5's own addons,
 # derived here from pkg-config instead of CMAKE_INSTALL_LIBDIR.
 pkg_get_variable(FCITX5CORE_LIBDIR Fcitx5Core libdir)
-set(FCITX5_ADDON_DIR "${FCITX5CORE_LIBDIR}/fcitx5" CACHE PATH
-    "fcitx5 addon library directory" FORCE)
+# Default: install next to the running fcitx5's own addons (absolute path
+# from pkg-config, fcitx5 does NOT scan <prefix>/lib/fcitx5). Snap builds
+# flip VOICEINPUT_RELOCATABLE=ON so everything stays inside the prefix.
+option(VOICEINPUT_RELOCATABLE
+       "Install the addon under the CMake prefix (snap packaging)" OFF)
+if(VOICEINPUT_RELOCATABLE)
+    set(FCITX5_ADDON_DIR "${CMAKE_INSTALL_LIBDIR}/fcitx5")
+else()
+    set(FCITX5_ADDON_DIR "${FCITX5CORE_LIBDIR}/fcitx5" CACHE PATH
+        "fcitx5 addon library directory")
+endif()
 set(FCITX5_DATA_DIR "${CMAKE_INSTALL_DATADIR}/fcitx5" CACHE PATH
     "fcitx5 data directory")
 message(STATUS "fcitx5 addon library dir: ${FCITX5_ADDON_DIR}")
@@ -34,6 +43,8 @@ install(TARGETS fcitx5-voiceinput DESTINATION "${FCITX5_ADDON_DIR}")
 install(FILES src/voiceinput.conf DESTINATION "${FCITX5_DATA_DIR}/addon")
 install(PROGRAMS backend/voice_backend.py
         DESTINATION "${FCITX5_DATA_DIR}/voiceinput")
+install(PROGRAMS scripts/install-snap-addon.sh
+        DESTINATION "${FCITX5_DATA_DIR}/voiceinput")
 
 # Compile and install the addon gettext catalog so fcitx5-configtool can
 # show localized option labels (domain "fcitx5-voiceinput").
@@ -51,10 +62,32 @@ if(MSGFMT_EXECUTABLE)
     add_custom_target(voiceinput_po ALL DEPENDS "${VOICEINPUT_GMO}")
     install(FILES "${VOICEINPUT_GMO}"
             DESTINATION
-                "${CMAKE_INSTALL_FULL_LOCALEDIR}/${VOICEINPUT_PO_LANG}/LC_MESSAGES"
+                "${CMAKE_INSTALL_LOCALEDIR}/${VOICEINPUT_PO_LANG}/LC_MESSAGES"
             RENAME "fcitx5-voiceinput.mo")
 else()
     message(STATUS "msgfmt not found: zh_CN catalog will not be installed")
 endif()
 
 feature_summary(WHAT ALL FATAL_ON_MISSING_REQUIRED_PACKAGES)
+
+# ---- Packaging: deb via CPack (snap is built by snapcraft.yaml) ----
+set(CPACK_PACKAGE_NAME "fcitx5-voiceinput")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_VENDOR "fcitx5-voiceinput contributors")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Local voice input addon for fcitx5")
+set(CPACK_PACKAGE_DESCRIPTION
+    "Press a hotkey, speak, and the recognized text is typed into the
+focused application. Speech recognition (SenseVoice / Paraformer /
+Whisper / FireRedASR via sherpa-onnx) and endpoint detection (Silero VAD)
+run completely locally - no cloud service.
+
+Requires the sherpa-onnx python package: pip3 install --user sherpa-onnx")
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER
+    "fcitx5-voiceinput contributors <noreply@example.com>")
+set(CPACK_DEBIAN_PACKAGE_SECTION "utils")
+set(CPACK_DEBIAN_PACKAGE_DEPENDS
+    "fcitx5, python3, python3-numpy, alsa-utils | pipewire-utils")
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
+set(CPACK_OUTPUT_FILE_PREFIX "${CMAKE_BINARY_DIR}/dist")
+include(CPack)
