@@ -471,11 +471,26 @@ private:
             });
     }
 
+    // XIM (XWayland) and the Wayland keyboard-grab frontend cannot reliably
+    // deliver a forwarded key back to the client (observed on GNOME
+    // Wayland: a swallowed short space press never reappears). Re-emit the
+    // text via commit there; immodule frontends keep the key forward so
+    // the spacebar semantics (page scrolling, button activation) survive.
+    bool frontendNeedsCommit(InputContext *ic) {
+        const char *fe = ic ? ic->frontend() : nullptr;
+        return fe && (strcmp(fe, "xim") == 0 || strcmp(fe, "waylandim") == 0);
+    }
+
     void holdEmitSpace() {
         auto *ic = instance_->inputContextManager().findByUUID(holdIcUuid_);
         fprintf(stderr, "[voiceinput] hold: emitting space (ic=%p)\n",
                 static_cast<void *>(ic));
-        if (ic) {
+        if (!ic) {
+            return;
+        }
+        if (frontendNeedsCommit(ic)) {
+            ic->commitString(" ");
+        } else {
             ic->forwardKey(Key(FcitxKey_space));
         }
     }
