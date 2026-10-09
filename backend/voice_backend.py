@@ -3,7 +3,8 @@
 """fcitx5-voiceinput backend.
 
 Records microphone audio, performs endpoint detection with Silero VAD and
-transcribes speech locally with SenseVoiceSmall (INT8) via sherpa-onnx.
+transcribes speech locally with a selectable sherpa-onnx offline model
+(SenseVoice / Paraformer / Whisper / FireRedASR).
 
 Subcommands:
   doctor    Check dependencies / download & verify models / test load.
@@ -12,6 +13,7 @@ Subcommands:
 Session protocol (stdout):
   PARTIAL\\n<draft text>\\n     live draft of the current phrase (preedit)
   COMMIT\\n<final text>\\n     final text of one VAD segment (committed)
+  NEWLINE\\n                    line break requested via Enter (no payload)
   TICK\\n<seconds>\\n           seconds left before the idle auto-stop
   ERROR\\n<message>\\n          on failure
   DONE\\n                       session finished
@@ -19,6 +21,7 @@ Diagnostics go to stderr.
 """
 
 import argparse
+import fcntl
 import os
 import queue
 import re
@@ -42,11 +45,38 @@ CHUNK_SAMPLES = 4096
 
 DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share")))
 DEFAULT_MODEL_DIR = DATA_HOME / "fcitx5-voiceinput" / "models"
-ASR_DIRNAME = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
 BASE_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models"
-ASR_TARBALL_URL = f"{BASE_URL}/{ASR_DIRNAME}.tar.bz2"
 VAD_URL = f"{BASE_URL}/silero_vad.onnx"
-ASR_REPO = f"csukuangfj/{ASR_DIRNAME}"
+
+# Offline recognition models selectable in the fcitx5 configuration panel.
+# `type` selects the sherpa_onnx.OfflineRecognizer factory; every tarball
+# comes from the official sherpa-onnx asr-models GitHub release.
+MODEL_REGISTRY = {
+    "sense-voice-small": {
+        "dirname": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+        "type": "sense_voice",
+        "size": "约 230 MB",
+        # Prefer per-file HF downloads (~239 MB) over the ~1 GB tarball.
+        "hf_repo": "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+    },
+    "paraformer-zh": {
+        "dirname": "sherpa-onnx-paraformer-zh-2023-09-14",
+        "type": "paraformer",
+        "size": "约 230 MB",
+    },
+    "whisper-base": {
+        "dirname": "sherpa-onnx-whisper-base",
+        "type": "whisper",
+        "size": "约 145 MB",
+    },
+    "fire-red-asr-large": {
+        "dirname": "sherpa-onnx-fire-red-asr-large-zh_en-2025-02-16",
+        "type": "fire_red",
+        "size": "约 1.2 GB",
+    },
+}
+MODEL_CHOICES = tuple(MODEL_REGISTRY)
+DEFAULT_MODEL_ID = "sense-voice-small"
 
 # Streaming model used only for the live preedit draft (small bilingual
 # zh-en zipformer); the final committed text always comes from SenseVoice.
@@ -287,6 +317,152 @@ def _tighten_cjk(text: str) -> str:
     return _CJK_TIGHT.sub("", text)
 
 
+def emit_status(msg: str) -> None:
+    """Send a panel status note to the fcitx5 addon ("" clears it)."""
+    print("STATUS", flush=True)
+    print(msg, flush=True)
+
+
+def model_entry(model_id: str) -> dict:
+    return MODEL_REGISTRY.get(model_id, MODEL_REGISTRY[DEFAULT_MODEL_ID])
+
+
+def _pick_model_file(base: Path, pattern: str):
+    cands = sorted(base.glob(pattern))
+    files = [p for p in cands if "int8" in p.name] or cands
+    return files[0] if files else None
+
+
+def find_offline_model(model_id: str, model_dir: Path):
+    """Resolve the onnx files of the selected model; None if incomplete."""
+    entry = model_entry(model_id)
+    base = model_dir / entry["dirname"]
+    if not base.is_dir():
+        return None
+    kind = entry["type"]
+    if kind in ("sense_voice", "paraformer"):
+        need = {"model": _pick_model_file(base, "model*.onnx"),
+                "tokens": base / "tokens.txt"}
+    elif kind == "whisper":
+        need = {"encoder": _pick_model_file(base, "*encoder*.onnx"),
+                "decoder": _pick_model_file(base, "*decoder*.onnx"),
+                "tokens": _pick_model_file(base, "*tokens*.txt")}
+    else:  # fire_red
+        need = {"encoder": _pick_model_file(base, "*encoder*.onnx"),
+                "decoder": _pick_model_file(base, "*decoder*.onnx"),
+                "tokens": base / "tokens.txt"}
+    if any(v is None or not Path(v).is_file() for v in need.values()):
+        return None
+    need = {k: str(v) for k, v in need.items()}
+    need["kind"] = kind
+    return need
+
+
+def ensure_vad(model_dir: Path) -> bool:
+    vad_path = model_dir / "silero_vad.onnx"
+    if vad_path.is_file() and vad_path.stat().st_size < 500_000:
+        print("    检测到不完整的 VAD 模型，重新下载...", file=sys.stderr)
+        vad_path.unlink()
+    if not vad_path.is_file():
+        try:
+            download(VAD_URL, vad_path)
+        except Exception as e:  # noqa: BLE001
+            print(f"    ✘ 下载 VAD 模型失败: {e}", file=sys.stderr)
+            return False
+    return True
+
+
+def prepare_offline_model(model_id: str, model_dir: Path) -> bool:
+    """Serialize model preparation across processes (doctor + sessions)."""
+    model_dir.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(model_dir / ".download.lock", "w")
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            emit_status("识别模型正在后台下载，请稍候…")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            emit_status("")
+        return _prepare_offline_locked(model_id, model_dir)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
+
+def _prepare_offline_locked(model_id: str, model_dir: Path) -> bool:
+    """Make sure the selected offline model + VAD exist, downloading if not."""
+    if not ensure_vad(model_dir):
+        return False
+    if find_offline_model(model_id, model_dir):
+        return True
+    entry = model_entry(model_id)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    emit_status(f"正在下载识别模型（{entry['size']}），请稍候…")
+    print(f"[voice] 开始下载模型 {entry['dirname']}", file=sys.stderr,
+          flush=True)
+    hf_repo = entry.get("hf_repo")
+    if hf_repo:
+        # Preferred path: per-file downloads, much smaller than the tarball.
+        base = model_dir / entry["dirname"]
+        base.mkdir(parents=True, exist_ok=True)
+        int8 = base / "model.int8.onnx"
+        tokens = base / "tokens.txt"
+        if int8.is_file() and int8.stat().st_size < 100_000_000:
+            print("    检测到不完整的识别模型，重新下载...", file=sys.stderr)
+            int8.unlink()
+        if not int8.is_file():
+            if not download_first(f"{hf_repo}/resolve/main/model.int8.onnx",
+                                  int8, HF_BASES):
+                print("    回退到完整压缩包...", file=sys.stderr)
+            elif not tokens.is_file():
+                download_first(f"{hf_repo}/resolve/main/tokens.txt",
+                               tokens, HF_BASES)
+    if not find_offline_model(model_id, model_dir):
+        archive = model_dir / (entry["dirname"] + ".tar.bz2")
+        if not archive.is_file() or archive.stat().st_size < 1_000_000:
+            try:
+                download(f"{BASE_URL}/{entry['dirname']}.tar.bz2", archive)
+            except Exception as e:  # noqa: BLE001
+                print(f"    ✘ 下载识别模型失败: {e}", file=sys.stderr)
+                emit_status("模型下载失败，请检查网络")
+                return False
+        print("    解压中...", file=sys.stderr)
+        try:
+            with tarfile.open(archive, "r:bz2") as tar:
+                tar.extractall(model_dir)
+        except Exception as e:  # noqa: BLE001
+            print(f"    ✘ 解压失败: {e}", file=sys.stderr)
+            emit_status("模型解压失败，详见系统日志")
+            return False
+    ok = find_offline_model(model_id, model_dir) is not None
+    emit_status("" if ok else "模型下载失败，详见系统日志")
+    return ok
+
+
+def load_offline_recognizer(sherpa_onnx, model_id: str, model_dir: Path,
+                            lang: str, itn: bool):
+    """Load the selected offline model with its matching factory."""
+    files = find_offline_model(model_id, model_dir)
+    if files is None:
+        raise RuntimeError(
+            f"模型文件不完整: {model_entry(model_id)['dirname']}")
+    kind = files["kind"]
+    common = dict(tokens=files["tokens"], num_threads=2)
+    lang = "" if lang == "auto" else lang
+    if kind == "sense_voice":
+        return sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=files["model"], use_itn=itn, language=lang, **common)
+    if kind == "paraformer":
+        return sherpa_onnx.OfflineRecognizer.from_paraformer(
+            paraformer=files["model"], **common)
+    if kind == "whisper":
+        return sherpa_onnx.OfflineRecognizer.from_whisper(
+            encoder=files["encoder"], decoder=files["decoder"],
+            language=lang, task="transcribe", **common)
+    return sherpa_onnx.OfflineRecognizer.from_fire_red_asr(
+        encoder=files["encoder"], decoder=files["decoder"], **common)
+
+
 def find_streaming_model(model_dir: Path):
     """Locate streaming zipformer onnx files (prefer int8 variants)."""
     base = model_dir / STREAM_DIRNAME
@@ -330,21 +506,23 @@ def load_online_recognizer(sherpa_onnx, model_dir: Path):
 
 
 def cmd_session(args) -> int:
+    flush_mode = 0  # 1 = flush pending audio (SIGUSR1), 2 = flush + newline
+
     def on_sigint(signum, frame):
         raise KeyboardInterrupt
 
+    def on_usr(signum, frame):
+        # Enter / newline requests are flag-based (no exceptions) so they
+        # are safe at any point in the main loop.
+        nonlocal flush_mode
+        flush_mode = 1 if signum == signal.SIGUSR1 else 2
+
     signal.signal(signal.SIGINT, on_sigint)
+    signal.signal(signal.SIGUSR1, on_usr)
+    signal.signal(signal.SIGUSR2, on_usr)
 
     model_dir = Path(args.model_dir) if args.model_dir else DEFAULT_MODEL_DIR
-    asr_model = model_dir / ASR_DIRNAME / "model.int8.onnx"
-    tokens = model_dir / ASR_DIRNAME / "tokens.txt"
     vad_model = model_dir / "silero_vad.onnx"
-
-    for p in (asr_model, tokens, vad_model):
-        if not p.is_file():
-            print(f"ERROR\n模型缺失: {p}，请先运行 voice_backend.py doctor",
-                  flush=True)
-            return 1
 
     rec = None
     reader_t = None
@@ -381,15 +559,20 @@ def cmd_session(args) -> int:
               flush=True)
         return 1
 
-    language = "" if args.lang == "auto" else args.lang
     try:
-        recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-            model=str(asr_model),
-            tokens=str(tokens),
-            num_threads=2,
-            use_itn=args.itn,
-            language=language,
-        )
+        # First use of a freshly selected model: download on the fly. Mic
+        # audio is already buffering in memory, so nothing is lost.
+        if find_offline_model(args.model, model_dir) is None:
+            if not prepare_offline_model(args.model, model_dir):
+                if rec:
+                    rec.close()
+                print("ERROR\n模型下载失败，请检查网络或手动运行 doctor",
+                      flush=True)
+                return 1
+        emit_status("正在加载识别模型…")
+        recognizer = load_offline_recognizer(
+            sherpa_onnx, args.model, model_dir, args.lang, args.itn)
+        emit_status("")
     except Exception as e:  # noqa: BLE001
         if rec:
             rec.close()
@@ -486,6 +669,21 @@ def cmd_session(args) -> int:
                     last_tick = remain
                     print("TICK", flush=True)
                     print(remain, flush=True)
+                if flush_mode:
+                    # Enter pressed: commit the pending segment now and
+                    # keep listening; mode 2 also inserts a line break
+                    # (a newline cannot travel as a COMMIT payload).
+                    enter_newline = flush_mode == 2
+                    flush_mode = 0
+                    if not flush_vad():
+                        return 1
+                    if enter_newline:
+                        print("NEWLINE", flush=True)
+                    last_draft = ""
+                    last_output_at = time.monotonic()
+                    if ostream is not None:
+                        ostream = online.create_stream()
+                    continue
                 try:
                     data = chunks.get(timeout=0.2)
                 except queue.Empty:
@@ -588,54 +786,6 @@ def check_resources() -> bool:
     return ok
 
 
-def prepare_models(model_dir: Path) -> bool:
-    asr_dir = model_dir / ASR_DIRNAME
-    asr_dir.mkdir(parents=True, exist_ok=True)
-
-    # Speech recognition model: prefer single-file downloads (~239 MB) over
-    # the ~1 GB upstream tarball.
-    int8_model = asr_dir / "model.int8.onnx"
-    tokens = asr_dir / "tokens.txt"
-    if int8_model.is_file() and int8_model.stat().st_size < 100_000_000:
-        print("    检测到不完整的识别模型，重新下载...", file=sys.stderr)
-        int8_model.unlink()
-    if not int8_model.is_file():
-        if not download_first(f"{ASR_REPO}/resolve/main/model.int8.onnx",
-                              int8_model, HF_BASES):
-            print("    回退到完整压缩包（约 1 GB）...", file=sys.stderr)
-            archive = model_dir / (ASR_DIRNAME + ".tar.bz2")
-            if not archive.is_file():
-                try:
-                    download(ASR_TARBALL_URL, archive)
-                except Exception as e:  # noqa: BLE001
-                    print(f"    ✘ 下载识别模型失败: {e}", file=sys.stderr)
-                    return False
-            print("    解压中...", file=sys.stderr)
-            try:
-                with tarfile.open(archive, "r:bz2") as tar:
-                    tar.extractall(model_dir)
-            except Exception as e:  # noqa: BLE001
-                print(f"    ✘ 解压失败: {e}", file=sys.stderr)
-                return False
-    if not tokens.is_file():
-        if not download_first(f"{ASR_REPO}/resolve/main/tokens.txt",
-                              tokens, HF_BASES):
-            print("    ✘ tokens.txt 下载失败", file=sys.stderr)
-            return False
-
-    vad_path = model_dir / "silero_vad.onnx"
-    if vad_path.is_file() and vad_path.stat().st_size < 500_000:
-        print("    检测到不完整的 VAD 模型，重新下载...", file=sys.stderr)
-        vad_path.unlink()
-    if not vad_path.is_file():
-        try:
-            download(VAD_URL, vad_path)
-        except Exception as e:  # noqa: BLE001
-            print(f"    ✘ 下载 VAD 模型失败: {e}", file=sys.stderr)
-            return False
-    return True
-
-
 def prepare_streaming_model(model_dir: Path) -> bool:
     """Download the live-preedit streaming model (optional, recommended)."""
     if find_streaming_model(model_dir):
@@ -657,24 +807,29 @@ def prepare_streaming_model(model_dir: Path) -> bool:
     return find_streaming_model(model_dir) is not None
 
 
-def verify_models(model_dir: Path) -> bool:
-    asr_dir = model_dir / ASR_DIRNAME
-    checks = [
-        (asr_dir / "model.int8.onnx", 1_000_000, "语音识别模型 (INT8)"),
-        (asr_dir / "tokens.txt", 10_000, "词表 tokens.txt"),
-        (model_dir / "silero_vad.onnx", 100_000, "语音检测模型 Silero VAD"),
-    ]
+def verify_models(model_dir: Path, model_id: str) -> bool:
     ok = True
-    for path, min_size, desc in checks:
-        if not path.is_file() or path.stat().st_size < min_size:
-            print(f"    ✘ {desc} 缺失或损坏: {path}", file=sys.stderr)
-            ok = False
-        else:
-            print(f"    ✔ {desc} ({path.stat().st_size / 1e6:.1f} MB)",
-                  file=sys.stderr)
+    entry = model_entry(model_id)
+    files = find_offline_model(model_id, model_dir)
+    if files:
+        for k, v in files.items():
+            if k == "kind":
+                continue
+            print(f"    ✔ 识别模型 {k} "
+                  f"({Path(v).stat().st_size / 1e6:.1f} MB)", file=sys.stderr)
+    else:
+        print(f"    ✘ 识别模型文件不完整: {entry['dirname']}", file=sys.stderr)
+        ok = False
+    vad_path = model_dir / "silero_vad.onnx"
+    if vad_path.is_file() and vad_path.stat().st_size >= 100_000:
+        print(f"    ✔ 语音检测模型 Silero VAD "
+              f"({vad_path.stat().st_size / 1e6:.1f} MB)", file=sys.stderr)
+    else:
+        print(f"    ✘ 语音检测模型缺失或损坏: {vad_path}", file=sys.stderr)
+        ok = False
     if ok:
         try:
-            make_vad(model_dir / "silero_vad.onnx", 800)
+            make_vad(vad_path, 800)
         except Exception as e:  # noqa: BLE001
             print(f"    ✘ VAD 模型加载失败（文件可能损坏）: {e}", file=sys.stderr)
             ok = False
@@ -687,16 +842,17 @@ def verify_models(model_dir: Path) -> bool:
 
 def cmd_doctor(args) -> int:
     model_dir = Path(args.model_dir) if args.model_dir else DEFAULT_MODEL_DIR
+    entry = model_entry(args.model)
 
     print("[1/6] 检查本地资源", file=sys.stderr, flush=True)
     if not check_resources():
         print("DOCTOR FAIL", file=sys.stderr)
         return 1
 
-    print("[2/6] 准备语音识别模型 (SenseVoiceSmall INT8)", file=sys.stderr,
-          flush=True)
+    print(f"[2/6] 准备识别模型 ({entry['dirname']}，{entry['size']})",
+          file=sys.stderr, flush=True)
     print("[3/6] 准备语音检测模型 (Silero VAD)", file=sys.stderr, flush=True)
-    if not prepare_models(model_dir):
+    if not prepare_offline_model(args.model, model_dir):
         print("DOCTOR FAIL", file=sys.stderr)
         return 1
 
@@ -706,22 +862,16 @@ def cmd_doctor(args) -> int:
               file=sys.stderr)
 
     print("[5/6] 校验模型文件", file=sys.stderr, flush=True)
-    if not verify_models(model_dir):
+    if not verify_models(model_dir, args.model):
         print("DOCTOR FAIL", file=sys.stderr)
         return 1
 
-    print("[6/6] 加载 SenseVoiceSmall (INT8)", file=sys.stderr, flush=True)
+    print(f"[6/6] 试加载识别模型 ({args.model})", file=sys.stderr, flush=True)
     try:
         import sherpa_onnx
 
-        asr_dir = model_dir / ASR_DIRNAME
-        recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-            model=str(asr_dir / "model.int8.onnx"),
-            tokens=str(asr_dir / "tokens.txt"),
-            num_threads=1,
-            use_itn=True,
-            language="",
-        )
+        recognizer = load_offline_recognizer(
+            sherpa_onnx, args.model, model_dir, "auto", True)
         stream = recognizer.create_stream()
         silence = np.zeros(SAMPLE_RATE, dtype=np.float32)
         stream.accept_waveform(SAMPLE_RATE, silence)
@@ -741,10 +891,14 @@ def main() -> int:
 
     p_doc = sub.add_parser("doctor", help="检查依赖 / 下载模型 / 验证加载")
     p_doc.add_argument("--model-dir", default=None)
+    p_doc.add_argument("--model", default=DEFAULT_MODEL_ID,
+                       choices=MODEL_CHOICES)
 
     p_sess = sub.add_parser("session", help="执行一次语音输入会话")
+    p_sess.add_argument("--model", default=DEFAULT_MODEL_ID,
+                        choices=MODEL_CHOICES)
     p_sess.add_argument("--lang", default="auto", choices=LANG_CHOICES)
-    p_sess.add_argument("--max-ms", type=int, default=30000)
+    p_sess.add_argument("--max-ms", type=int, default=6000)
     p_sess.add_argument("--silence-ms", type=int, default=800)
     p_sess.add_argument("--itn", action="store_true")
     p_sess.add_argument("--preedit", action="store_true",

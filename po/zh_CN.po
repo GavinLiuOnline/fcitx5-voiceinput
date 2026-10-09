@@ -18,6 +18,21 @@ msgstr "触发快捷键"
 msgid "Recognition Language"
 msgstr "识别语言"
 
+msgid "Recognition Model"
+msgstr "识别模型"
+
+msgid "SenseVoiceSmall"
+msgstr "SenseVoice Small（中英日韩粤，默认）"
+
+msgid "ParaformerZh"
+msgstr "Paraformer 中文（阿里，快速）"
+
+msgid "WhisperBase"
+msgstr "Whisper Base（多语言，CPU 较慢）"
+
+msgid "FireRedASRLarge"
+msgstr "FireRed ASR Large（中英，高精度）"
+
 msgid "Auto-stop Idle Seconds (no new text)"
 msgstr "空闲自动停止（秒，无新文字时计时）"
 

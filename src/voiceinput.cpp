@@ -69,6 +69,29 @@ const char *languageCode(VoiceLanguage lang) {
     }
 }
 
+enum class VoiceModel {
+    SenseVoiceSmall,
+    ParaformerZh,
+    WhisperBase,
+    FireRedAsrLarge,
+};
+FCITX_CONFIG_ENUM_NAME_WITH_I18N(VoiceModel, "SenseVoiceSmall",
+                                 "ParaformerZh", "WhisperBase",
+                                 "FireRedASRLarge");
+
+const char *modelCode(VoiceModel model) {
+    switch (model) {
+    case VoiceModel::ParaformerZh:
+        return "paraformer-zh";
+    case VoiceModel::WhisperBase:
+        return "whisper-base";
+    case VoiceModel::FireRedAsrLarge:
+        return "fire-red-asr-large";
+    default:
+        return "sense-voice-small";
+    }
+}
+
 FCITX_CONFIGURATION(
     VoiceInputConfig,
     KeyListOption triggerKey{
@@ -76,8 +99,10 @@ FCITX_CONFIGURATION(
         KeyListConstrain({KeyConstrainFlag::AllowModifierOnly})};
     Option<VoiceLanguage> language{this, "Language", _("Recognition Language"),
                                    VoiceLanguage::Auto};
+    OptionWithAnnotation<VoiceModel, VoiceModelI18NAnnotation> model{
+        this, "Model", _("Recognition Model"), VoiceModel::SenseVoiceSmall};
     Option<int, IntConstrain> maxSeconds{
-        this, "MaxSeconds", _("Auto-stop Idle Seconds (no new text)"), 30,
+        this, "MaxSeconds", _("Auto-stop Idle Seconds (no new text)"), 6,
         IntConstrain(3, 120)};
     Option<int, IntConstrain> silenceMs{this, "SilenceMs",
                                         _("Sentence Pause (ms; draft commits on pause)"),
@@ -106,6 +131,45 @@ public:
                     return;
                 }
                 if (!keyEvent.key().checkKeyList(config_.triggerKey.value())) {
+                    if (recording_ && !interrupted_) {
+                        const auto &key = keyEvent.key();
+                        // Editing keys while dictating:
+                        //   Escape    end the session (same as trigger key)
+                        //   Return    insert a newline (after flushing the
+                        //             pending phrase)
+                        //   BackSpace delete the last committed character
+                        if (key.check(Key("Escape"))) {
+                            finalizeRecording();
+                            keyEvent.filterAndAccept();
+                            return;
+                        }
+                        if (key.check(Key("Return"))) {
+                            ::kill(child_, SIGUSR2);
+                            keyEvent.filterAndAccept();
+                            return;
+                        }
+                        if (key.check(Key("BackSpace"))) {
+                            if (auto *ic = keyEvent.inputContext()) {
+                                ic->forwardKey(Key("BackSpace"));
+                            }
+                            keyEvent.filterAndAccept();
+                            return;
+                        }
+                        // Any other simple printable key is typed straight
+                        // into the text field, so English letters, digits
+                        // and punctuation can be mixed into dictation.
+                        if (key.isSimple()) {
+                            const auto ch = Key::keySymToUnicode(key.sym());
+                            if (ch >= 0x20 && ch != 0x7f) {
+                                if (auto *ic = keyEvent.inputContext()) {
+                                    ic->commitString(
+                                        Key::keySymToUTF8(key.sym()));
+                                }
+                                keyEvent.filterAndAccept();
+                                return;
+                            }
+                        }
+                    }
                     return;
                 }
                 trigger(keyEvent.inputContext());
@@ -119,6 +183,22 @@ public:
                     static_cast<InputContextCreatedEvent &>(event);
                 created.inputContext()->statusArea().addAction(
                     StatusGroup::AfterInputMethod, &action_);
+            });
+
+        // Focus left the field being dictated to (another window, another
+        // input box, or the desktop): stop the recording. Moving the text
+        // cursor inside the same field does not generate a focus change, so
+        // it never interrupts a session.
+        focusHandler_ = instance_->watchEvent(
+            EventType::InputContextFocusOut, EventWatcherPhase::Default,
+            [this](Event &event) {
+                if (!recording_) {
+                    return;
+                }
+                auto &focusEvent = static_cast<FocusOutEvent &>(event);
+                if (focusEvent.inputContext()->uuid() == icUuid_) {
+                    cancelSession();
+                }
             });
 
         action_.setIcon("audio-input-microphone");
@@ -178,13 +258,23 @@ private:
                 if (interrupted_) {
                     return false;
                 }
-                showStatus(std::string("🎤 ") + _("Recording") + " " +
-                           std::to_string(elapsed) + "s (" +
-                           std::to_string(idleRemain_) + "s " +
-                           _("idle auto stop") + ")");
+                showStatus(recordingStatus());
                 scheduleTick();
                 return false;
             });
+    }
+
+    // Panel status line: a backend note (model download/loading) takes
+    // precedence; otherwise show elapsed time + idle auto-stop countdown.
+    std::string recordingStatus() const {
+        if (!statusNote_.empty()) {
+            return std::string("🎤 ") + statusNote_;
+        }
+        const auto elapsed =
+            (now(CLOCK_MONOTONIC) - startTime_) / 1000000;
+        return std::string("🎤 ") + _("Recording") + " " +
+               std::to_string(elapsed) + "s (" +
+               std::to_string(idleRemain_) + "s " + _("idle auto stop") + ")";
     }
 
     void trigger(InputContext *ic) {
@@ -193,15 +283,20 @@ private:
             return;
         }
         if (!interrupted_) {
-            // Second press: finalize the current audio and transcribe.
-            interrupted_ = true;
-            showStatus(_("Recognizing..."));
-            ::kill(child_, SIGINT);
+            finalizeRecording();
             return;
         }
         // Third press: backend is stuck, hard cancel.
         showStatus(_("Voice input cancelled"));
         cancelSession();
+    }
+
+    // Second trigger-key press (or Escape): stop recording and transcribe
+    // the remaining audio.
+    void finalizeRecording() {
+        interrupted_ = true;
+        showStatus(_("Recognizing..."));
+        ::kill(child_, SIGINT);
     }
 
     void startSession(InputContext *ic) {
@@ -214,6 +309,7 @@ private:
         hasPartial_ = false;
         lastByte_ = 0;
         idleRemain_ = config_.maxSeconds.value();
+        statusNote_.clear();
 
         int pipefd[2];
         if (::pipe2(pipefd, O_CLOEXEC) != 0) {
@@ -228,6 +324,8 @@ private:
         args.push_back("session");
         args.push_back("--lang");
         args.push_back(languageCode(config_.language.value()));
+        args.push_back("--model");
+        args.push_back(modelCode(config_.model.value()));
         args.push_back("--max-ms");
         args.push_back(std::to_string(config_.maxSeconds.value() * 1000));
         args.push_back("--silence-ms");
@@ -421,7 +519,9 @@ private:
     //   COMMIT\n<text>\n   final text of one VAD segment -> drop the
     //                      preedit and commit into the application
     //   TICK\n<sec>\n      seconds left before the idle auto-stop
+    //   STATUS\n<msg>\n    panel note (model download/loading); "" clears
     //   ERROR\n<msg>\n     fatal error -> show message
+    //   NEWLINE\n          line break requested via Enter (no payload)
     //   DONE\n             session finished
     void processLines() {
         auto pos = buffer_.find('\n');
@@ -454,6 +554,10 @@ private:
                 case PayloadKind::Tick:
                     idleRemain_ = std::atoi(line.c_str());
                     break;
+                case PayloadKind::Status:
+                    statusNote_ = line;
+                    showStatus(recordingStatus());
+                    break;
                 }
             } else if (line == "PARTIAL") {
                 expectPayload_ = true;
@@ -464,6 +568,11 @@ private:
             } else if (line == "TICK") {
                 expectPayload_ = true;
                 payloadKind_ = PayloadKind::Tick;
+            } else if (line == "STATUS") {
+                expectPayload_ = true;
+                payloadKind_ = PayloadKind::Status;
+            } else if (line == "NEWLINE") {
+                commitText("\n");
             } else if (line == "ERROR") {
                 expectPayload_ = true;
                 payloadKind_ = PayloadKind::Error;
@@ -545,6 +654,7 @@ private:
     VoiceInputConfig config_;
     std::unique_ptr<HandlerTableEntry<EventHandler>> keyHandler_;
     std::unique_ptr<HandlerTableEntry<EventHandler>> icCreatedHandler_;
+    std::unique_ptr<HandlerTableEntry<EventHandler>> focusHandler_;
     SimpleAction action_;
     std::unique_ptr<EventSourceIO> ioSource_;
     std::unique_ptr<EventSourceTime> tickTimer_;
@@ -562,9 +672,10 @@ private:
     signed char lastByte_ = 0;
 
     // Kind of the payload line announced by the preceding tag line.
-    enum class PayloadKind { Commit, Preedit, Error, Tick };
+    enum class PayloadKind { Commit, Preedit, Error, Tick, Status };
     PayloadKind payloadKind_ = PayloadKind::Commit;
     int idleRemain_ = 30;
+    std::string statusNote_;
     CapabilityFlags savedCaps_{};
     bool capsForced_ = false;
     bool savedPreeditEnabled_ = true;

@@ -21,6 +21,9 @@ service, no audio ever leaves your machine.
   stop manually. Model-appended sentence-final punctuation is stripped
   when a segment commits, so no full stop is forced after every pause
 - **Multilingual** — auto / zh / en / ja / ko / yue (SenseVoice)
+- **Focus-aware** — switching to another window or input field while
+  dictating stops the recording automatically; moving the cursor inside
+  the same field never interrupts it
 - **Inverse text normalization** — spoken numbers become digits ("三点五" → "3.5")
 - **Status feedback** — recording/recognizing states shown in the fcitx5
   input panel; a microphone button appears in the input method toolbar
@@ -94,11 +97,27 @@ Options are under **fcitx5-configtool → Addons → Voice Input**:
 | --- | --- | --- |
 | Trigger Key | `Ctrl+Alt+V` | Hotkey to start/stop a session |
 | Recognition Language | Auto | auto / zh / en / ja / ko / yue |
-| Auto-stop Idle Seconds (no new text) | 30 | Stops after this many seconds without new recognized text; each new draft or commit restarts the countdown |
+| Recognition Model | SenseVoice Small | See "Recognition models" below |
+| Auto-stop Idle Seconds (no new text) | 6 | Stops after this many seconds without new recognized text; each new draft or commit restarts the countdown |
+| Keys while recording | — | `Esc` finish; `Enter` insert a newline; `BackSpace` delete the last committed character; letters/digits/punctuation are typed straight into the text field |
 | Sentence Pause (ms; draft commits on pause) | 800 | Pause length that turns the live draft into committed text |
 | Inverse Text Normalization | On | Convert spoken numbers to digits |
 | Live Preedit | On | Streaming draft shown while speaking (zh/en) |
 | Python / Backend / Model Directory | — | Advanced paths |
+
+### Recognition models
+
+Pick one in fcitx5-configtool; the first use **downloads it automatically**
+(mic audio is buffered meanwhile, nothing is lost):
+
+| Model | Languages | Size | Notes |
+| --- | --- | --- | --- |
+| SenseVoice Small (default) | zh/en/ja/ko/yue | ~230 MB | Best all-round, ITN support |
+| Paraformer zh | zh | ~230 MB | Alibaba, fast Chinese ASR |
+| Whisper Base | multilingual | ~145 MB | OpenAI Whisper, slower on CPU |
+| FireRed ASR Large | zh/en | ~1.2 GB | High accuracy |
+
+Pre-download via CLI: `python3 backend/voice_backend.py doctor --model paraformer-zh`
 
 ## CLI debugging
 
