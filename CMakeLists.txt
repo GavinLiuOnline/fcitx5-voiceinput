@@ -90,9 +90,11 @@ set(CPACK_DEBIAN_PACKAGE_DEPENDS
 set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
     "${CMAKE_CURRENT_SOURCE_DIR}/debian/postinst")
 # GTK/Qt apps are most reliable over their immodules (dbus frontend);
-# without these packages they fall back to XIM where a forwarded key may
-# never reach the client (Wayland sessions).
-set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "fcitx5-gtk, fcitx5-qt")
+# without these packages they fall back to the ibus link where a commit may
+# be dropped (GNOME Wayland). Ubuntu 22.04/Debian 12 split them into
+# fcitx5-frontend-* binaries; older layouts use fcitx5-gtk/fcitx5-qt.
+set(CPACK_DEBIAN_PACKAGE_RECOMMENDS
+    "fcitx5-frontend-gtk3 | fcitx5-gtk, fcitx5-frontend-gtk4 | fcitx5-gtk, fcitx5-frontend-qt5 | fcitx5-qt")
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
 set(CPACK_OUTPUT_FILE_PREFIX "${CMAKE_BINARY_DIR}/dist")
